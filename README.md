@@ -1,6 +1,6 @@
 # echolink-tui
 
-An EchoLink client for Linux, written in Rust, with two front ends on one engine:
+An EchoLink client for Linux and macOS, written in Rust, with two front ends on one engine:
 
 - **`echolink-gui`**: a desktop app with a big push-to-talk button, a searchable station list
   with favorites, and a settings window.
@@ -26,7 +26,24 @@ An EchoLink client for Linux, written in Rust, with two front ends on one engine
   on your router), or an **EchoLink proxy** (below). Starlink, cellular and other
   carrier-grade NAT connections can't forward ports, so they need the proxy.
 
-## Install
+## Install on macOS
+
+```bash
+brew install rustup libgsm
+export PATH="/opt/homebrew/opt/rustup/bin:$PATH" && rustup default stable
+git clone https://github.com/KI6UIT/echolink-tui && cd echolink-tui
+./install.sh            # or ./install.sh --tui-only
+```
+
+This builds `~/Applications/EchoLink.app` (double-click it, or find it in Launchpad) and
+puts `echolink-tui` in `~/.local/bin`. Allow microphone access when macOS asks. Because
+the app isn't notarized, if macOS blocks it, right-click it, choose Open, or run
+`xattr -dr com.apple.quarantine ~/Applications/EchoLink.app`. On macOS the settings file
+is `~/Library/Application Support/echolink-tui/config.toml` and the log is in
+`~/Library/Application Support/echolink-tui/activity.log`. Audio uses the default CoreAudio
+devices. `tests/run-peer-test.sh` is Linux-only.
+
+## Install on Linux
 
 ```bash
 git clone https://github.com/KI6UIT/echolink-tui

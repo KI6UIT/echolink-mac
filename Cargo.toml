@@ -2,7 +2,7 @@
 name = "echolink-tui"
 version = "0.1.0"
 edition = "2024"
-description = "EchoLink client for the Linux terminal"
+description = "EchoLink client for the Linux and macOS terminal"
 license = "GPL-2.0-or-later"
 
 [lib]
@@ -30,7 +30,7 @@ anyhow = "1.0.104"
 cpal = "0.15"
 crossterm = "0.28"
 dirs = "7.0.0"
-eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"], optional = true }
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"], optional = true }
 egui_extras = { version = "0.31", optional = true }
 flate2 = "1.1.10"
 md5 = "0.8.1"
@@ -38,3 +38,7 @@ ratatui = "0.29"
 rpassword = "7.5.4"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.8"
+
+# Window-system backends are only needed on Linux/BSD; macOS uses its native one.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+eframe = { version = "0.31", default-features = false, features = ["wayland", "x11"], optional = true }

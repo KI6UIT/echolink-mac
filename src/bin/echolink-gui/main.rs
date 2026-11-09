@@ -154,9 +154,22 @@ impl Gui {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn notify(text: &str) {
     let _ = std::process::Command::new("notify-send")
         .args(["--app-name=EchoLink", "--icon=audio-input-microphone", "EchoLink", text])
+        .spawn();
+}
+
+#[cfg(target_os = "macos")]
+fn notify(text: &str) {
+    // Pass the text as an argument so quotes in chat can't break out of the script.
+    let _ = std::process::Command::new("osascript")
+        .args([
+            "-e",
+            "on run argv\ndisplay notification (item 1 of argv) with title \"EchoLink\"\nend run",
+            text,
+        ])
         .spawn();
 }
 

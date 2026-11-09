@@ -11,7 +11,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 static LOG: OnceLock<Mutex<(File, i64)>> = OnceLock::new();
 
 pub fn path() -> PathBuf {
-    dirs::state_dir().unwrap_or_else(|| PathBuf::from(".")).join("echolink-tui/activity.log")
+    // state_dir() is None on macOS; fall back to ~/Library/Application Support.
+    dirs::state_dir()
+        .or_else(dirs::data_local_dir)
+        .unwrap_or_else(|| PathBuf::from(".")).join("echolink-tui/activity.log")
 }
 
 /// Seconds east of UTC, from `date +%z` (e.g. "-0500").
