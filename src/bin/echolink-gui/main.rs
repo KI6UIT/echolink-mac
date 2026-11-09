@@ -2,8 +2,9 @@
 //! window, a big push-to-talk button and a settings dialog.
 
 mod settings;
+mod theme;
 
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, Color32, FontFamily, RichText};
 use echolink::config::{self, Config};
 use echolink::directory::Station;
 use echolink::qso::{State, TX_LIMIT};
@@ -52,7 +53,7 @@ struct Gui {
 
 impl Gui {
     fn new(cc: &eframe::CreationContext) -> Gui {
-        cc.egui_ctx.set_zoom_factor(1.1);
+        theme::install(&cc.egui_ctx);
         let mut gui = Gui {
             session: None,
             start_error: None,
@@ -223,7 +224,7 @@ impl eframe::App for Gui {
                 ui.vertical_centered(|ui| {
                     ui.add_space(80.0);
                     if let Some(e) = &self.start_error {
-                        ui.heading("EchoLink couldn't start");
+                        ui.label(theme::head("EchoLink couldn't start", 24.0).color(theme::accent()));
                         ui.add_space(8.0);
                         ui.colored_label(ui.visuals().error_fg_color, e);
                         ui.add_space(12.0);
@@ -231,7 +232,8 @@ impl eframe::App for Gui {
                             self.settings = Some(settings::Form::new(config::load().ok().as_ref()));
                         }
                     } else {
-                        ui.heading("Set up your station to begin.");
+                        ui.label(theme::silk("No station configured"));
+                        ui.label(theme::head("Set up your station to begin.", 24.0).color(theme::accent()));
                     }
                 });
             });
@@ -247,72 +249,111 @@ impl eframe::App for Gui {
             .min_width(360.0_f32.min(list_max))
             .max_width(list_max)
             .show(ctx, |ui| {
+                ui.set_opacity(theme::reveal(ctx, "list", 0.05));
                 self.station_list(ui);
             });
-        egui::CentralPanel::default().show(ctx, |ui| self.qso_panel(ui));
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.set_opacity(theme::reveal(ctx, "qso", 0.30));
+            self.qso_panel(ui)
+        });
         self.handle_ptt(ctx);
     }
 }
 
 impl Gui {
     fn top_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.add_space(4.0);
+        let frame = egui::Frame::new()
+            .fill(theme::chassis())
+            .stroke(egui::Stroke::new(1.0, theme::edge()))
+            .inner_margin(egui::Margin::symmetric(14, 8));
+        egui::TopBottomPanel::top("top").frame(frame).show(ctx, |ui| {
+            ui.set_opacity(theme::reveal(ctx, "top", 0.0));
             ui.horizontal(|ui| {
-                ui.label(RichText::new("EchoLink").size(20.0).strong());
+                ui.label(theme::head("ECHO", 24.0).color(theme::accent()));
+                ui.add_space(-8.0);
+                ui.label(theme::head("LINK", 24.0).color(theme::text()));
                 if let Some(s) = &self.session {
-                    ui.separator();
-                    ui.label(RichText::new(&s.cfg.callsign).size(16.0).strong());
-                    ui.separator();
-                    // Painted, since the default font has no filled-circle glyph.
-                    let color = if s.dir_ok { Color32::from_rgb(60, 180, 90) } else { Color32::from_rgb(220, 160, 40) };
-                    let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                    ui.painter().circle_filled(rect.center(), 5.0, color);
-                    ui.label(&s.dir_status);
+                    ui.add_space(10.0);
+                    // Callsign plate.
+                    egui::Frame::new()
+                        .fill(theme::screen())
+                        .stroke(egui::Stroke::new(1.0, theme::accent_dim()))
+                        .corner_radius(3)
+                        .inner_margin(egui::Margin::symmetric(10, 3))
+                        .show(ui, |ui| ui.label(theme::data(&s.cfg.callsign, 16.0).color(theme::accent())));
+                    ui.add_space(6.0);
+                    // A lamp, painted (no glyph needed) with a soft halo.
+                    let color = if s.dir_ok { theme::rx() } else { theme::accent() };
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 8.0, color.gamma_multiply(0.18));
+                    ui.painter().circle_filled(rect.center(), 4.5, color);
+                    ui.label(RichText::new(&s.dir_status).color(theme::muted()).small());
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("⚙ Settings").clicked() {
+                    if ui.button("SETTINGS").clicked() {
                         let current = config::load().ok();
                         self.settings = Some(settings::Form::new(current.as_ref()));
                     }
                     if let Some(s) = &mut self.session
-                        && ui.button("⟳ Refresh list").clicked()
+                        && ui.button("REFRESH LIST").clicked()
                     {
                         s.refresh();
                     }
+                    ui.add_space(6.0);
+                    if let Some(i) = theme::picker(ui) {
+                        theme::set(ctx, i);
+                    }
                 });
             });
-            ui.add_space(4.0);
         });
     }
 
     fn status_bar(&self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+        let frame = egui::Frame::new()
+            .fill(theme::chassis())
+            .stroke(egui::Stroke::new(1.0, theme::edge()))
+            .inner_margin(egui::Margin::symmetric(14, 5));
+        egui::TopBottomPanel::bottom("status").frame(frame).show(ctx, |ui| {
             let line = self
                 .session
                 .as_ref()
                 .and_then(|s| s.log.iter().rev().find(|(k, _)| *k == LogKind::System).map(|(_, t)| t.as_str()))
                 .unwrap_or("");
-            ui.label(RichText::new(line).weak());
+            ui.label(RichText::new(format!("> {line}")).monospace().size(12.0).color(theme::accent_dim()));
         });
     }
 
     fn station_list(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
+        ui.add_space(6.0);
         let mut changed = false;
         ui.horizontal(|ui| {
             changed |= ui
-                .add(egui::TextEdit::singleline(&mut self.search).hint_text("🔍 Search callsign, place or node #").desired_width(260.0))
+                .add(
+                    egui::TextEdit::singleline(&mut self.search)
+                        .font(egui::FontId::new(14.0, theme::mono_medium()))
+                        .hint_text("search call / place / node")
+                        .desired_width(250.0)
+                        .margin(egui::Margin::symmetric(8, 5)),
+                )
                 .changed();
-            if !self.search.is_empty() && ui.small_button("✖").clicked() {
+            if !self.search.is_empty() && ui.small_button("CLR").clicked() {
                 self.search.clear();
                 changed = true;
             }
-            changed |= ui.toggle_value(&mut self.favorites_only, "★ Favorites").changed();
+            changed |= ui.toggle_value(&mut self.favorites_only, "★ FAVORITES").changed();
         });
         ui.horizontal(|ui| {
             for f in Filter::ALL {
-                if ui.selectable_label(self.filter == f, f.label()).clicked() {
+                let on = self.filter == f;
+                let label = if on {
+                    theme::head(f.label().to_uppercase(), 13.0).color(theme::on_accent())
+                } else {
+                    theme::head(f.label().to_uppercase(), 13.0).color(theme::muted())
+                };
+                let b = egui::Button::new(label)
+                    .fill(if on { theme::accent() } else { Color32::TRANSPARENT })
+                    .stroke(egui::Stroke::NONE);
+                if ui.add(b).clicked() {
                     self.filter = f;
                     changed = true;
                 }
@@ -340,7 +381,7 @@ impl Gui {
             });
             return;
         }
-        ui.label(RichText::new(format!("{} of {} stations", self.visible.len(), s.stations.len())).small().weak());
+        ui.label(theme::silk(&format!("{} of {} stations on air", self.visible.len(), s.stations.len())));
 
         let favs: Vec<String> = self.favorites().to_vec();
         let mut clicked: Option<String> = None;
@@ -350,41 +391,41 @@ impl Gui {
             .striped(true)
             .sense(egui::Sense::click())
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(Column::exact(24.0))
-            .column(Column::initial(105.0))
-            .column(Column::initial(70.0))
+            .column(Column::exact(26.0))
+            .column(Column::initial(118.0))
+            .column(Column::initial(76.0))
             .column(Column::remainder().clip(true))
-            .column(Column::exact(44.0))
-            .header(22.0, |mut h| {
+            .column(Column::exact(48.0))
+            .header(24.0, |mut h| {
                 for t in ["", "Call", "Node", "Location", ""] {
                     h.col(|ui| {
-                        ui.strong(t);
+                        ui.label(theme::silk(t));
                     });
                 }
             })
             .body(|body| {
-                body.rows(24.0, self.visible.len(), |mut row| {
+                body.rows(27.0, self.visible.len(), |mut row| {
                     let st = &s.stations[self.visible[row.index()]];
                     let is_fav = favs.contains(&st.callsign);
                     row.set_selected(self.selected.as_deref() == Some(st.callsign.as_str()));
                     row.col(|ui| {
-                        let icon = if is_fav { RichText::new("★").color(Color32::GOLD) } else { RichText::new("☆").weak() };
+                        let icon = if is_fav { RichText::new("★").color(theme::accent()) } else { RichText::new("☆").color(theme::edge()) };
                         if ui.add(egui::Label::new(icon).sense(egui::Sense::click())).on_hover_text("Favorite").clicked() {
                             star = Some(st.callsign.clone());
                         }
                     });
                     row.col(|ui| {
-                        ui.label(RichText::new(&st.callsign).strong());
+                        ui.label(theme::data(&st.callsign, 14.0).color(if is_fav { theme::accent() } else { theme::text() }));
                     });
                     row.col(|ui| {
-                        ui.label(st.id.to_string());
+                        ui.label(RichText::new(st.id.to_string()).monospace().size(12.5).color(theme::muted()));
                     });
                     row.col(|ui| {
-                        ui.label(&st.description);
+                        ui.label(RichText::new(&st.description).color(theme::text().gamma_multiply(0.85)));
                     });
                     row.col(|ui| {
                         if st.busy {
-                            ui.label(RichText::new("busy").color(Color32::from_rgb(220, 160, 40)).small());
+                            ui.label(theme::silk("busy").color(theme::tx()));
                         }
                     });
                     let r = row.response();
@@ -416,63 +457,88 @@ impl Gui {
         let Some(s) = &mut self.session else { return };
         ui.add_space(6.0);
 
-        // Who we're talking to, or the station picked in the list.
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        // The readout: who we're talking to, or the station picked in the list.
+        let (rx_active, marker_id) = match &s.state {
+            State::Connected { .. } => (s.receiving, selected.as_ref().map(|st| st.id)),
+            _ => (false, selected.as_ref().map(|st| st.id)),
+        };
+        let _ = rx_active;
+        let screen = egui::Frame::new()
+            .fill(theme::screen())
+            .stroke(egui::Stroke::new(1.0, theme::edge()))
+            .corner_radius(4)
+            .inner_margin(egui::Margin::symmetric(16, 12));
+        let resp = screen.show(ui, |ui| {
             ui.set_width(ui.available_width());
+            let on_air = matches!(s.state, State::Connected { .. });
             match s.state.clone() {
                 State::Connected { callsign, name, .. } => {
-                    ui.label(RichText::new("Connected").color(Color32::from_rgb(60, 180, 90)).strong());
-                    ui.label(RichText::new(&callsign).size(28.0).strong());
+                    ui.label(theme::silk("Linked"));
+                    ui.label(theme::head(&callsign, 44.0).color(theme::accent()));
                     let info = if s.remote_info.is_empty() { name } else { s.remote_info.clone() };
-                    ui.label(info.trim());
+                    ui.label(RichText::new(info.trim()).color(theme::text().gamma_multiply(0.8)));
                     ui.add_space(4.0);
-                    if ui.button("Disconnect").clicked() {
+                    if ui.button("DISCONNECT").clicked() {
                         s.disconnect();
                     }
                 }
                 State::Connecting { label, .. } => {
+                    ui.label(theme::silk("Calling"));
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label(RichText::new(format!("Calling {label}…")).size(18.0));
+                        ui.label(theme::head(&label, 30.0).color(theme::accent()));
                     });
-                    if ui.button("Cancel").clicked() {
+                    ui.add_space(4.0);
+                    if ui.button("CANCEL").clicked() {
                         s.disconnect();
                     }
                 }
                 State::Idle => match &selected {
                     Some(st) => {
-                        ui.label(RichText::new(&st.callsign).size(28.0).strong());
-                        ui.label(format!("Node {}{}", st.id, if st.busy { " · busy" } else { "" }));
-                        ui.label(&st.description);
+                        ui.label(theme::silk(if st.busy { "Selected / busy" } else { "Selected" }));
+                        ui.label(theme::head(&st.callsign, 44.0).color(theme::accent()));
+                        ui.label(
+                            RichText::new(format!("NODE {}   {}", st.id, st.description))
+                                .monospace()
+                                .size(12.5)
+                                .color(theme::muted()),
+                        );
                         ui.add_space(4.0);
-                        if ui.add(egui::Button::new(RichText::new("📞 Connect").size(16.0))).clicked() {
+                        if ui.button("CONNECT").clicked() {
                             s.connect(st);
                         }
                     }
                     None => {
-                        ui.label(RichText::new("Not connected").size(18.0));
-                        ui.label(RichText::new("Pick a station on the left and double-click it, or enter a node number.").weak());
+                        ui.label(theme::silk("Standby"));
+                        ui.label(theme::head("NOT CONNECTED", 34.0).color(theme::accent_dim()));
+                        ui.label(RichText::new("Pick a station and double-click it, or dial a node number.").color(theme::muted()));
                     }
                 },
             }
+            ui.add_space(8.0);
+            // The tuning scale parks its marker by node number: a stable "frequency" per station.
+            theme::dial(ui, marker_id.map(|id| (id % 1000) as f32 / 1000.0), on_air);
         });
+        theme::scanlines(&ui.painter_at(resp.response.rect.shrink(1.0)), resp.response.rect.shrink(1.0));
 
-        ui.add_space(6.0);
+        ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
             let r = ui.add(
                 egui::TextEdit::singleline(&mut self.node_input)
-                    .hint_text("Node number")
+                    .font(egui::FontId::new(14.0, theme::mono_medium()))
+                    .hint_text("node #")
                     .char_limit(7)
-                    .desired_width(110.0),
+                    .margin(egui::Margin::symmetric(8, 5))
+                    .desired_width(100.0),
             );
             self.node_input.retain(|c| c.is_ascii_digit());
             let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if (ui.button("Connect to node").clicked() || enter)
+            if (ui.button("CONNECT TO NODE").clicked() || enter)
                 && let Ok(id) = self.node_input.parse()
             {
                 s.connect_node(id);
             }
-            if ui.button("🔊 Audio test (ECHOTEST)").on_hover_text("Records what you say and plays it back").clicked() {
+            if ui.button("ECHOTEST").on_hover_text("Records what you say and plays it back").clicked() {
                 s.connect_node(ECHOTEST_NODE);
             }
         });
@@ -485,26 +551,19 @@ impl Gui {
         ui.add_space(8.0);
         let rx = s.audio.shared.rx_level.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0;
         let tx = s.audio.shared.tx_level.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0;
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("RX").strong());
-            let rx_color = if s.receiving { Color32::from_rgb(60, 180, 90) } else { Color32::from_gray(120) };
-            ui.add(egui::ProgressBar::new(rx).fill(rx_color).desired_width(ui.available_width()));
-        });
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("TX").strong());
-            ui.add(egui::ProgressBar::new(tx).fill(Color32::from_rgb(210, 60, 50)).desired_width(ui.available_width()));
-        });
+        theme::led_meter(ui, "RX", rx, true);
+        theme::led_meter(ui, "TX", tx, true);
 
         // Messages and chat.
         ui.add_space(10.0);
-        ui.label(RichText::new("Messages").strong());
+        ui.label(theme::silk("Station log"));
         let log_height = (ui.available_height() - 40.0).max(60.0);
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        egui::Frame::new().fill(theme::screen()).stroke(egui::Stroke::new(1.0, theme::edge())).corner_radius(3).inner_margin(8).show(ui, |ui| {
             egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).max_height(log_height).show(ui, |ui| {
                 for (kind, line) in &s.log {
                     match kind {
-                        LogKind::Chat => ui.label(RichText::new(line).color(Color32::from_rgb(230, 180, 40))),
-                        LogKind::System => ui.label(RichText::new(line).weak()),
+                        LogKind::Chat => ui.label(RichText::new(line).monospace().size(13.0).color(theme::accent())),
+                        LogKind::System => ui.label(RichText::new(line).monospace().size(12.5).color(theme::muted())),
                     };
                 }
             });
@@ -514,10 +573,10 @@ impl Gui {
         ui.horizontal(|ui| {
             let r = ui.add_enabled(
                 connected,
-                egui::TextEdit::singleline(&mut self.chat_input).hint_text("Chat message").desired_width(ui.available_width() - 70.0),
+                egui::TextEdit::singleline(&mut self.chat_input).font(egui::FontId::new(14.0, theme::mono_medium())).hint_text("chat message").margin(egui::Margin::symmetric(8, 5)).desired_width(ui.available_width() - 80.0),
             );
             let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if (ui.add_enabled(connected, egui::Button::new("Send")).clicked() || enter) && !self.chat_input.trim().is_empty() {
+            if (ui.add_enabled(connected, egui::Button::new("SEND")).clicked() || enter) && !self.chat_input.trim().is_empty() {
                 s.chat(&self.chat_input);
                 self.chat_input.clear();
                 r.request_focus();
@@ -528,24 +587,66 @@ impl Gui {
     fn ptt_button(&mut self, ui: &mut egui::Ui) {
         let Some(s) = &self.session else { return };
         let connected = s.connected();
-        let (text, fill) = match s.tx_since {
+        let now = ui.input(|i| i.time);
+        let (text, sub, accent, hot) = match s.tx_since {
             Some(t) => {
                 let secs = t.elapsed().as_secs();
                 let warn = t.elapsed() > TX_LIMIT - Duration::from_secs(30);
                 (
-                    format!("● TRANSMITTING  {}:{:02}", secs / 60, secs % 60),
-                    if warn { Color32::from_rgb(255, 90, 0) } else { Color32::from_rgb(200, 40, 40) },
+                    "ON AIR".to_string(),
+                    format!("{}:{:02}{}", secs / 60, secs % 60, if warn { "  ·  RELEASE SOON" } else { "" }),
+                    if warn { theme::accent() } else { theme::tx() },
+                    true,
                 )
             }
-            None if s.receiving => ("Receiving…".to_string(), Color32::from_rgb(40, 130, 70)),
-            None if connected => ("Hold to talk  (or hold Space)".to_string(), Color32::from_rgb(55, 90, 150)),
-            None => ("Connect to a station to talk".to_string(), Color32::from_gray(70)),
+            None if s.receiving => ("RECEIVING".to_string(), "stand by".to_string(), theme::rx(), false),
+            None if connected => ("PUSH TO TALK".to_string(), "hold here  ·  or hold SPACE".to_string(), theme::accent(), false),
+            None => ("NO LINK".to_string(), "connect to a station to talk".to_string(), theme::edge(), false),
         };
-        let size = egui::vec2(ui.available_width(), 84.0);
-        let font = (size.x / 18.0).clamp(14.0, 22.0);
-        let button = egui::Button::new(RichText::new(text).size(font).strong().color(Color32::WHITE)).fill(fill);
-        let r = ui.add_enabled(connected, button.min_size(size));
-        self.ptt_held_by_mouse = r.is_pointer_button_down_on();
+        let size = egui::vec2(ui.available_width(), 88.0);
+        let sense = if connected { egui::Sense::click_and_drag() } else { egui::Sense::hover() };
+        let (rect, r) = ui.allocate_exact_size(size, sense);
+        let down = connected && r.is_pointer_button_down_on();
+        let p = ui.painter();
+        // Transmit glow breathes; everything else is still.
+        let pulse = if hot { 0.55 + 0.45 * ((now * 5.0).sin() as f32 * 0.5 + 0.5) } else { 0.0 };
+        if hot {
+            for i in 1..=5 {
+                p.rect_stroke(
+                    rect.expand(i as f32 * 2.5),
+                    4.0 + i as f32 * 2.0,
+                    egui::Stroke::new(2.0, accent.gamma_multiply(pulse * 0.22 / i as f32)),
+                    egui::StrokeKind::Outside,
+                );
+            }
+        }
+        let fill = if hot {
+            accent.gamma_multiply(0.22 + 0.12 * pulse)
+        } else if down {
+            theme::accent().gamma_multiply(0.25)
+        } else if r.hovered() && connected {
+            theme::pal().hover
+        } else {
+            theme::screen()
+        };
+        p.rect_filled(rect, 4.0, fill);
+        p.rect_stroke(rect, 4.0, egui::Stroke::new(if hot || connected { 2.0 } else { 1.0 }, accent), egui::StrokeKind::Inside);
+        // Corner screws, because it's hardware.
+        for (dx, dy) in [(1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)] {
+            let c = egui::pos2(
+                if dx > 0.0 { rect.left() + 9.0 } else { rect.right() - 9.0 },
+                if dy > 0.0 { rect.top() + 9.0 } else { rect.bottom() - 9.0 },
+            );
+            p.circle_filled(c, 2.5, accent.gamma_multiply(0.35));
+        }
+        // Lamp.
+        let lamp = egui::pos2(rect.left() + 38.0, rect.center().y);
+        p.circle_filled(lamp, 15.0, accent.gamma_multiply(if hot { 0.25 * pulse + 0.1 } else { 0.1 }));
+        p.circle_filled(lamp, 8.0, if hot || s.receiving || connected { accent } else { accent.gamma_multiply(0.4) });
+        let tx = rect.left() + 68.0;
+        p.text(egui::pos2(tx, rect.center().y - 11.0), egui::Align2::LEFT_CENTER, text, egui::FontId::new(30.0, theme::display()), if connected { accent } else { theme::muted() });
+        p.text(egui::pos2(tx, rect.center().y + 20.0), egui::Align2::LEFT_CENTER, sub, egui::FontId::new(12.5, FontFamily::Monospace), theme::muted());
+        self.ptt_held_by_mouse = down;
     }
 
     fn handle_ptt(&mut self, ctx: &egui::Context) {
