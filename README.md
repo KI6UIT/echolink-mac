@@ -360,3 +360,7 @@ GPL-2.0-or-later, the same as SvxLink, whose protocol code this follows. See [LI
 
 EchoLink® is a registered trademark of Synergenix Interactive, LLC. This project isn't
 affiliated with or endorsed by it.
+
+
+73's
+KI6UIT
