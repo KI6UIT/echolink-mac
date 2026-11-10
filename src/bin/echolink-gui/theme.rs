@@ -198,7 +198,44 @@ pub fn mono_medium() -> FontFamily {
 
 /// Small spaced-out caps label, like silkscreen on a front panel.
 pub fn silk(text: &str) -> RichText {
-    RichText::new(text.to_uppercase()).font(FontId::new(11.0, display())).color(accent_dim())
+    // Between the dim and full accent, so small labels stay readable on the dark panels.
+    let c = accent_dim().lerp_to_gamma(accent(), 0.45);
+    RichText::new(text.to_uppercase()).font(FontId::new(11.5, display())).color(c)
+}
+
+/// A clearly visible tab: filled in the accent colour when selected, outlined when not.
+pub fn tab_button(ui: &mut egui::Ui, label: &str, selected: bool) -> bool {
+    let (fill, stroke, color) = if selected {
+        (accent(), Stroke::new(1.0, accent()), on_accent())
+    } else {
+        (raised(), Stroke::new(1.0, accent_dim()), text())
+    };
+    ui.add(
+        egui::Button::new(RichText::new(label).font(FontId::new(13.0, display())).color(color))
+            .fill(fill)
+            .stroke(stroke)
+            .min_size(Vec2::new(130.0, 28.0)),
+    )
+    .clicked()
+}
+
+/// A section header that is a real button with a clear arrow, for things that open and close.
+pub fn section_toggle(ui: &mut egui::Ui, label: &str, open: bool) -> bool {
+    let r = ui.add(
+        egui::Button::new(RichText::new(label).font(FontId::new(12.5, display())).color(text()))
+            .fill(raised())
+            .stroke(Stroke::new(1.0, accent_dim()))
+            .min_size(Vec2::new(170.0, 26.0)),
+    );
+    // The arrow is painted, so it never depends on a font having the glyph.
+    let c = Pos2::new(r.rect.right() - 14.0, r.rect.center().y);
+    let pts = if open {
+        vec![Pos2::new(c.x - 5.0, c.y - 3.0), Pos2::new(c.x + 5.0, c.y - 3.0), Pos2::new(c.x, c.y + 4.0)]
+    } else {
+        vec![Pos2::new(c.x - 3.0, c.y - 5.0), Pos2::new(c.x - 3.0, c.y + 5.0), Pos2::new(c.x + 4.0, c.y)]
+    };
+    ui.painter().add(egui::Shape::convex_polygon(pts, accent(), Stroke::NONE));
+    r.clicked()
 }
 
 /// Headline text in the display face.
@@ -282,8 +319,8 @@ fn apply(ctx: &egui::Context) {
         w.noninteractive.corner_radius = r;
         w.inactive.bg_fill = raised();
         w.inactive.weak_bg_fill = raised();
-        w.inactive.bg_stroke = Stroke::new(1.0, edge());
-        w.inactive.fg_stroke = Stroke::new(1.0, text());
+        w.inactive.bg_stroke = Stroke::new(1.0, muted().gamma_multiply(0.85)); // checkbox boxes and button edges
+        w.inactive.fg_stroke = Stroke::new(1.6, text()); // and the tick inside them
         w.inactive.corner_radius = r;
         w.hovered.bg_fill = k.hover;
         w.hovered.weak_bg_fill = k.hover;

@@ -348,8 +348,12 @@ impl Gui {
     /// STATION LOG | LOGBOOK.
     fn tab_row(tab: &mut Tab, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.selectable_value(tab, Tab::Station, theme::silk("STATION LOG"));
-            ui.selectable_value(tab, Tab::Logbook, theme::silk("LOGBOOK"));
+            if theme::tab_button(ui, "STATION LOG", *tab == Tab::Station) {
+                *tab = Tab::Station;
+            }
+            if theme::tab_button(ui, "LOGBOOK", *tab == Tab::Logbook) {
+                *tab = Tab::Logbook;
+            }
         });
     }
 
@@ -1144,8 +1148,7 @@ impl Gui {
         let Some(s) = &mut self.session else { return };
         let connected = s.connected();
         let open = self.keypad_open;
-        let head = ui.add(egui::Button::new(theme::silk(if open { "DTMF KEYPAD  ▾" } else { "DTMF KEYPAD  ▸" })).frame(false));
-        if head.clicked() {
+        if theme::section_toggle(ui, "DTMF KEYPAD", open) {
             self.keypad_open = !open;
         }
         if !self.keypad_open {
@@ -1604,77 +1607,43 @@ impl Gui {
         (if resp.dragged() { resp.drag_delta().y } else { 0.0 }, resp.drag_stopped())
     }
 
-    /// Readout, connect row and talk key.
+    /// Connect row, node entry, and the talk-and-station tile.
     fn qso_top(&mut self, ui: &mut egui::Ui) {
+        self.deck(ui);
+    }
+
+    /// The controls you reach for most, kept at the very top: connect / disconnect (naming the
+    /// station), dial a node, the echo test and recent stations, then the talk key and status.
+    fn deck(&mut self, ui: &mut egui::Ui) {
         let selected = self.selected_station().cloned();
         let Some(s) = &mut self.session else { return };
         ui.add_space(6.0);
-
-        // The readout: who we're talking to, or the station picked in the list.
-        let (rx_active, marker_id) = match &s.state {
-            State::Connected { .. } => (s.receiving, selected.as_ref().map(|st| st.id)),
-            _ => (false, selected.as_ref().map(|st| st.id)),
-        };
-        let _ = rx_active;
-        let screen = egui::Frame::new()
-            .fill(theme::screen())
-            .stroke(egui::Stroke::new(1.0, theme::edge()))
-            .corner_radius(4)
-            .inner_margin(egui::Margin::symmetric(16, 12));
-        let resp = screen.show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            let on_air = matches!(s.state, State::Connected { .. });
-            match s.state.clone() {
-                State::Connected { callsign, name, .. } => {
-                    ui.label(theme::silk("Linked"));
-                    ui.label(theme::head(&callsign, 44.0).color(theme::accent()));
-                    let info = if s.remote_info.is_empty() { name } else { s.remote_info.clone() };
-                    ui.label(RichText::new(info.trim()).color(theme::text().gamma_multiply(0.8)));
-                    ui.add_space(4.0);
-                    if ui.button("DISCONNECT").clicked() {
-                        s.disconnect();
-                    }
+        let width = ui.available_width();
+        let big = |text: String, color: egui::Color32| egui::Button::new(RichText::new(text).size(15.0).color(color).strong());
+        match s.state.clone() {
+            State::Connected { callsign, .. } => {
+                if ui.add_sized([width, 34.0], big(format!("DISCONNECT    {callsign}"), theme::tx())).on_hover_text("Hang up").clicked() {
+                    s.disconnect();
                 }
-                State::Connecting { label, .. } => {
-                    ui.label(theme::silk("Calling"));
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(theme::head(&label, 30.0).color(theme::accent()));
-                    });
-                    ui.add_space(4.0);
-                    if ui.button("CANCEL").clicked() {
-                        s.disconnect();
-                    }
-                }
-                State::Idle => match &selected {
-                    Some(st) => {
-                        ui.label(theme::silk(if st.busy { "Selected / busy" } else { "Selected" }));
-                        ui.label(theme::head(&st.callsign, 44.0).color(theme::accent()));
-                        ui.label(
-                            RichText::new(format!("NODE {}   {}", st.id, st.description))
-                                .monospace()
-                                .size(12.5)
-                                .color(theme::muted()),
-                        );
-                        ui.add_space(4.0);
-                        if ui.button("CONNECT").clicked() {
-                            s.connect(st);
-                        }
-                    }
-                    None => {
-                        ui.label(theme::silk("Standby"));
-                        ui.label(theme::head("NOT CONNECTED", 34.0).color(theme::accent_dim()));
-                        ui.label(RichText::new("Pick a station and double-click it, or dial a node number.").color(theme::muted()));
-                    }
-                },
             }
-            ui.add_space(8.0);
-            // The tuning scale parks its marker by node number: a stable "frequency" per station.
-            theme::dial(ui, marker_id.map(|id| (id % 1000) as f32 / 1000.0), on_air);
-        });
-        theme::scanlines(&ui.painter_at(resp.response.rect.shrink(1.0)), resp.response.rect.shrink(1.0));
-
-        ui.add_space(8.0);
+            State::Connecting { label, .. } => {
+                if ui.add_sized([width, 34.0], big(format!("CANCEL    calling {label}…"), theme::accent())).on_hover_text("Stop calling").clicked() {
+                    s.disconnect();
+                }
+            }
+            State::Idle => match &selected {
+                Some(st) => {
+                    if ui.add_sized([width, 34.0], big(format!("CONNECT    {}", st.callsign), theme::accent())).on_hover_text("Call the station selected in the list").clicked() {
+                        s.connect(st);
+                    }
+                }
+                None => {
+                    ui.add_enabled(false, egui::Button::new(RichText::new("NOT CONNECTED").size(15.0)).min_size(egui::vec2(width, 34.0)))
+                        .on_disabled_hover_text("Pick a station in the list, or dial a node number below");
+                }
+            },
+        }
+        ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
             let r = ui.add(
                 egui::TextEdit::singleline(&mut self.node_input)
@@ -1710,15 +1679,15 @@ impl Gui {
             }
         });
 
-        ui.add_space(10.0);
-        self.ptt_button(ui);
 
+        ui.add_space(8.0);
+        self.ptt_button(ui);
     }
 
     /// Gauges, mic and speaker controls, and the DTMF keypad.
     fn qso_audio(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
-        egui::CollapsingHeader::new(theme::silk("AUDIO")).default_open(true).show(ui, |ui| self.audio_panel(ui));
+        egui::CollapsingHeader::new(RichText::new("AUDIO").size(13.5).strong().color(theme::text())).default_open(true).show(ui, |ui| self.audio_panel(ui));
         self.keypad(ui);
     }
 
@@ -1763,6 +1732,7 @@ impl Gui {
     }
 
     fn ptt_button(&mut self, ui: &mut egui::Ui) {
+        let selected = self.selected_station().cloned();
         let Some(s) = &self.session else { return };
         let connected = s.connected();
         let now = ui.input(|i| i.time);
@@ -1788,9 +1758,13 @@ impl Gui {
             None if connected => ("PUSH TO TALK".to_string(), if self.hotkey_down_hint() { "hold here  ·  SPACE  ·  or your talk key" } else { "hold here  ·  or hold SPACE" }.to_string(), theme::accent(), false),
             None => ("NO LINK".to_string(), "connect to a station to talk".to_string(), theme::edge(), false),
         };
-        let size = egui::vec2(ui.available_width(), 88.0);
+        // One tile in two halves: the talk key on the left, the station on the right.
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 88.0), egui::Sense::hover());
+        let left_w = if rect.width() > 380.0 { (rect.width() * 0.58).clamp(230.0, rect.width() - 150.0) } else { rect.width() * 0.6 };
+        let left = egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + left_w, rect.bottom()));
+        let right = egui::Rect::from_min_max(egui::pos2(left.right(), rect.top()), rect.max);
         let sense = if connected { egui::Sense::click_and_drag() } else { egui::Sense::hover() };
-        let (rect, r) = ui.allocate_exact_size(size, sense);
+        let r = ui.interact(left, ui.id().with("ptt-tile"), sense);
         let down = connected && r.is_pointer_button_down_on();
         let p = ui.painter();
         // Transmit glow breathes; everything else is still.
@@ -1814,8 +1788,10 @@ impl Gui {
         } else {
             theme::screen()
         };
-        p.rect_filled(rect, 4.0, fill);
+        p.rect_filled(rect, 4.0, theme::screen());
+        p.rect_filled(left, egui::CornerRadius { nw: 4, sw: 4, ne: 0, se: 0 }, fill);
         p.rect_stroke(rect, 4.0, egui::Stroke::new(if hot || connected { 2.0 } else { 1.0 }, accent), egui::StrokeKind::Inside);
+        p.line_segment([egui::pos2(left.right(), rect.top() + 8.0), egui::pos2(left.right(), rect.bottom() - 8.0)], egui::Stroke::new(1.0, theme::edge()));
         // Corner screws, because it's hardware.
         for (dx, dy) in [(1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)] {
             let c = egui::pos2(
@@ -1824,13 +1800,34 @@ impl Gui {
             );
             p.circle_filled(c, 2.5, accent.gamma_multiply(0.35));
         }
-        // Lamp.
-        let lamp = egui::pos2(rect.left() + 38.0, rect.center().y);
+        // Left half: lamp, status, and what to do.
+        let lamp = egui::pos2(left.left() + 32.0, left.center().y);
         p.circle_filled(lamp, 15.0, accent.gamma_multiply(if hot { 0.25 * pulse + 0.1 } else { 0.1 }));
         p.circle_filled(lamp, 8.0, if hot || s.receiving || connected { accent } else { accent.gamma_multiply(0.4) });
-        let tx = rect.left() + 68.0;
-        p.text(egui::pos2(tx, rect.center().y - 11.0), egui::Align2::LEFT_CENTER, text, egui::FontId::new(30.0, theme::display()), if connected { accent } else { theme::muted() });
-        p.text(egui::pos2(tx, rect.center().y + 20.0), egui::Align2::LEFT_CENTER, sub, egui::FontId::new(12.5, FontFamily::Monospace), theme::muted());
+        let tx = left.left() + 58.0;
+        let title = ((left_w - 66.0) / 7.2).clamp(17.0, 30.0);
+        let lp = p.with_clip_rect(left.shrink2(egui::vec2(4.0, 0.0)));
+        lp.text(egui::pos2(tx, left.center().y - 11.0), egui::Align2::LEFT_CENTER, text, egui::FontId::new(title, theme::display()), if connected { accent } else { theme::muted() });
+        lp.text(egui::pos2(tx, left.center().y + 20.0), egui::Align2::LEFT_CENTER, sub, egui::FontId::new(if left_w < 280.0 { 11.0 } else { 12.5 }, FontFamily::Monospace), theme::muted());
+
+        // Right half: the station.
+        let (label, call, detail, call_color) = match &s.state {
+            State::Connected { callsign, name, .. } => {
+                let info = s.remote_info.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or(name.trim()).to_string();
+                ("LINKED", callsign.clone(), info, theme::accent())
+            }
+            State::Connecting { label, .. } => ("CALLING", label.clone(), String::new(), theme::accent()),
+            State::Idle => match &selected {
+                Some(st) => ("SELECTED", st.callsign.clone(), format!("NODE {}  {}", st.id, st.description), theme::accent()),
+                None => ("STANDBY", "NOT CONNECTED".to_string(), "pick a station or dial a node".to_string(), theme::accent_dim()),
+            },
+        };
+        let size = if call.len() > 10 { 17.0 } else if call.len() > 7 { 22.0 } else { 28.0 };
+        let rp = p.with_clip_rect(right.shrink2(egui::vec2(8.0, 4.0)));
+        let x = right.left() + 14.0;
+        rp.text(egui::pos2(x, right.top() + 16.0), egui::Align2::LEFT_CENTER, label, egui::FontId::new(10.5, theme::display()), theme::muted());
+        rp.text(egui::pos2(x, right.center().y + 1.0), egui::Align2::LEFT_CENTER, call, egui::FontId::new(size, theme::display()), call_color);
+        rp.text(egui::pos2(x, right.bottom() - 15.0), egui::Align2::LEFT_CENTER, detail, egui::FontId::new(11.0, FontFamily::Monospace), theme::muted());
         self.ptt_held_by_mouse = down;
     }
 
