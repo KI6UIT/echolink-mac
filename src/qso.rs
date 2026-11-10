@@ -60,6 +60,8 @@ pub struct Station {
     pub name: String,
     pub info: String,
     pub accept_incoming: bool,
+    /// Block list, allow list and Do Not Disturb; the app can change these while running.
+    pub rules: Arc<std::sync::RwLock<crate::config::Rules>>,
 }
 
 pub struct Handle {
@@ -157,6 +159,9 @@ pub fn spawn(
         tries: 0,
         last_heard: Instant::now(),
         last_voice: None,
+        link: Default::default(),
+        clock: Instant::now(),
+        last_voice_pkt: None,
         tx_started: None,
         tx_buf: Vec::new(),
         seq: 0,
@@ -183,6 +188,10 @@ struct Engine {
     tries: u32,
     last_heard: Instant,
     last_voice: Option<Instant>,
+    /// Voice packet health for the LINK gauge, and when the last one came.
+    link: crate::link::LinkStats,
+    clock: Instant,
+    last_voice_pkt: Option<Instant>,
     tx_started: Option<Instant>,
     tx_buf: Vec<i16>,
     seq: u16,
@@ -371,7 +380,7 @@ impl Engine {
                     self.connected(ip, callsign, rest);
                 }
             }
-            State::Idle if self.me.accept_incoming => {
+            State::Idle if self.me.accept_incoming && self.me.rules.read().unwrap().permits(&callsign).is_ok() => {
                 self.emit(Event::Log(format!("Incoming connection from {callsign} ({ip}).")));
                 self.emit(Event::Incoming(callsign.clone()));
                 self.connected(ip, callsign, rest);
@@ -379,13 +388,20 @@ impl Engine {
             _ => {
                 // Busy or not accepting: tell the caller we're not available.
                 self.send_ctrl(ip, &rtp::bye());
-                self.emit(Event::Log(format!("Refused a connection from {callsign}.")));
+                let why = match self.me.rules.read().unwrap().permits(&callsign) {
+                    Err(why) if self.me.accept_incoming => format!(": {why}"),
+                    _ => String::new(),
+                };
+                self.emit(Event::Log(format!("Refused a connection from {callsign}{why}.")));
             }
         }
     }
 
     fn connected(&mut self, ip: Ipv4Addr, callsign: String, name: String) {
         self.last_heard = Instant::now();
+        self.link.reset();
+        self.last_voice_pkt = None;
+        self.publish_link();
         self.set_state(State::Connected { ip, callsign: callsign.clone(), name });
         self.send_ctrl(ip, &self.sdes);
         self.next_keepalive = Instant::now() + KEEPALIVE;
@@ -399,6 +415,12 @@ impl Engine {
             return;
         }
         self.last_heard = Instant::now();
+        if let Some(seq) = rtp::voice_seq(p) {
+            // Measured even while we're talking: it's about the link, not the audio.
+            self.link.packet(seq, self.clock.elapsed().as_millis() as u64);
+            self.last_voice_pkt = Some(Instant::now());
+            self.publish_link();
+        }
         match rtp::parse_audio_port(p) {
             AudioPort::Voice(frames) => {
                 if self.transmitting.load(Ordering::Relaxed) {
@@ -445,8 +467,24 @@ impl Engine {
         self.seq = self.seq.wrapping_add(1);
     }
 
+    /// Hand the link figures to the screen.
+    fn publish_link(&self) {
+        let sh = &self.shared;
+        sh.link_loss_permille.store((self.link.loss_pct() * 10.0) as u32, Ordering::Relaxed);
+        sh.link_jitter_x10.store((self.link.jitter_ms() * 10.0) as u32, Ordering::Relaxed);
+        self.publish_ages();
+    }
+
+    fn publish_ages(&self) {
+        let sh = &self.shared;
+        sh.link_age_ms.store(self.last_heard.elapsed().as_millis().min(u32::MAX as u128 - 1) as u32, Ordering::Relaxed);
+        let voice = self.last_voice_pkt.map(|t| t.elapsed().as_millis().min(u32::MAX as u128 - 1) as u32).unwrap_or(u32::MAX);
+        sh.link_voice_age_ms.store(voice, Ordering::Relaxed);
+    }
+
     fn timers(&mut self) {
         let now = Instant::now();
+        self.publish_ages();
         if self.last_voice.is_some_and(|t| now - t > RX_HOLD) {
             self.last_voice = None;
             self.emit(Event::Receiving(false));
@@ -499,7 +537,7 @@ mod tests {
         let ip: Ipv4Addr = std::env::var("PEER_IP").expect("PEER_IP").parse().unwrap();
         let shared = Arc::new(Shared::default());
         let (mic_tx, mic_rx) = channel();
-        let me = Station { callsign: "TEST1".into(), name: "Tester".into(), info: "test info".into(), accept_incoming: false };
+        let me = Station { callsign: "TEST1".into(), name: "Tester".into(), info: "test info".into(), accept_incoming: false, rules: Default::default() };
         let (_udp_tx, udp_rx) = channel();
         let h = spawn(me, shared.clone(), mic_rx, Arc::new(AtomicBool::new(false)), &Net::Direct, udp_rx).unwrap();
 

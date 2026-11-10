@@ -49,6 +49,103 @@ pub struct Config {
     /// Hold this key combination to talk, from any app (macOS), e.g. "ctrl+alt+space".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ptt_hotkey: Option<String>,
+    /// Your QRZ logbook access key (from the QRZ website, under your logbook's settings).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qrz_key: Option<String>,
+    /// Send each contact to QRZ as soon as it ends.
+    #[serde(default = "yes")]
+    pub qrz_auto: bool,
+    /// When you quit, send any contacts QRZ doesn't have yet (waits for it to finish).
+    #[serde(default)]
+    pub qrz_on_exit: bool,
+    /// Your QRZ.com login, for looking up callsigns (separate from the logbook key).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qrz_user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qrz_pass: Option<String>,
+    /// QRZ and ADIF need a band and mode; EchoLink has neither, so these are what gets logged.
+    #[serde(default = "default_band")]
+    pub log_band: String,
+    #[serde(default = "default_mode")]
+    pub log_mode: String,
+    /// Calls and prefixes that can never connect to you: `K6ABC`, `W1*`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked: Vec<String>,
+    /// With `allow_only`, only these can connect.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed: Vec<String>,
+    #[serde(default)]
+    pub allow_only: bool,
+    /// Do Not Disturb: refuse every incoming call.
+    #[serde(default)]
+    pub dnd: bool,
+}
+
+/// Who may connect to us.
+#[derive(Clone, Debug, Default)]
+pub struct Rules {
+    pub blocked: Vec<String>,
+    pub allowed: Vec<String>,
+    pub allow_only: bool,
+    pub dnd: bool,
+}
+
+impl Rules {
+    pub fn from_config(c: &Config) -> Rules {
+        Rules { blocked: c.blocked.clone(), allowed: c.allowed.clone(), allow_only: c.allow_only, dnd: c.dnd }
+    }
+
+    /// `Ok` if `call` may connect, otherwise why not.
+    pub fn permits(&self, call: &str) -> Result<(), &'static str> {
+        if self.dnd {
+            return Err("Do Not Disturb is on");
+        }
+        if self.blocked.iter().any(|p| call_matches(p, call)) {
+            return Err("it's on your block list");
+        }
+        if self.allow_only && !self.allowed.iter().any(|p| call_matches(p, call)) {
+            return Err("it's not on your allow list");
+        }
+        Ok(())
+    }
+}
+
+/// `K6ABC` matches that call (with or without a `-R`/`-L` suffix); `W1*` matches a prefix.
+pub fn call_matches(pattern: &str, call: &str) -> bool {
+    let p = pattern.trim().to_uppercase();
+    let c = call.trim().to_uppercase();
+    let base = c.strip_suffix("-R").or_else(|| c.strip_suffix("-L")).unwrap_or(&c);
+    match p.strip_suffix('*') {
+        Some(prefix) => !prefix.is_empty() && base.starts_with(prefix),
+        None => !p.is_empty() && (p == c || p == base),
+    }
+}
+
+/// Split what a person typed into a list: spaces, commas or new lines.
+pub fn parse_list(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for w in text.split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
+        let w = w.trim().to_uppercase();
+        if !w.is_empty() && !out.contains(&w) {
+            out.push(w);
+        }
+    }
+    out
+}
+
+/// Change the saved settings in place (so other fields on disk are kept).
+pub fn update(f: impl FnOnce(&mut Config)) -> Result<()> {
+    let mut c = load()?;
+    f(&mut c);
+    save(&c)
+}
+
+fn default_band() -> String {
+    "2m".into()
+}
+
+fn default_mode() -> String {
+    "FM".into()
 }
 
 impl Config {
@@ -71,6 +168,17 @@ impl Config {
             output_device: None,
             speaker_volume: 1.0,
             ptt_hotkey: None,
+            qrz_key: None,
+            qrz_auto: true,
+            qrz_on_exit: false,
+            qrz_user: None,
+            qrz_pass: None,
+            log_band: default_band(),
+            log_mode: default_mode(),
+            blocked: Vec::new(),
+            allowed: Vec::new(),
+            allow_only: false,
+            dnd: false,
         }
     }
 }
@@ -180,8 +288,60 @@ pub fn setup() -> Result<()> {
         output_device: old.as_ref().and_then(|c| c.output_device.clone()),
         speaker_volume: old.as_ref().map(|c| c.speaker_volume).unwrap_or(1.0),
         ptt_hotkey: old.as_ref().and_then(|c| c.ptt_hotkey.clone()),
+        qrz_key: old.as_ref().and_then(|c| c.qrz_key.clone()),
+        qrz_auto: old.as_ref().map(|c| c.qrz_auto).unwrap_or(true),
+        qrz_on_exit: old.as_ref().map(|c| c.qrz_on_exit).unwrap_or(false),
+        qrz_user: old.as_ref().and_then(|c| c.qrz_user.clone()),
+        qrz_pass: old.as_ref().and_then(|c| c.qrz_pass.clone()),
+        log_band: old.as_ref().map(|c| c.log_band.clone()).unwrap_or_else(default_band),
+        log_mode: old.as_ref().map(|c| c.log_mode.clone()).unwrap_or_else(default_mode),
+        blocked: old.as_ref().map(|c| c.blocked.clone()).unwrap_or_default(),
+        allowed: old.as_ref().map(|c| c.allowed.clone()).unwrap_or_default(),
+        allow_only: old.as_ref().map(|c| c.allow_only).unwrap_or(false),
+        dnd: old.as_ref().map(|c| c.dnd).unwrap_or(false),
     };
     save(&cfg)?;
     println!("\nSaved to {} (readable only by you).", path().display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn call_matching() {
+        assert!(call_matches("K6ABC", "K6ABC"));
+        assert!(call_matches("k6abc", "K6ABC-R"), "node suffix and case don't matter");
+        assert!(call_matches("W1*", "W1AW"));
+        assert!(call_matches("W1*", "W1AW-L"));
+        assert!(!call_matches("W1*", "KW1AW"));
+        assert!(!call_matches("K6AB", "K6ABC"), "a bare call is exact, not a prefix");
+        assert!(!call_matches("*", "K6ABC") && !call_matches("", "K6ABC"));
+    }
+
+    #[test]
+    fn rules() {
+        let mut r = Rules { blocked: parse_list("N0BAD, W1*"), ..Default::default() };
+        assert!(r.permits("K6ABC").is_ok());
+        assert!(r.permits("N0BAD").is_err() && r.permits("W1AW").is_err());
+        r.allow_only = true;
+        r.allowed = parse_list("K6ABC\nK6DEF");
+        assert!(r.permits("K6ABC").is_ok() && r.permits("K6XYZ").is_err());
+        r.dnd = true;
+        assert_eq!(r.permits("K6ABC"), Err("Do Not Disturb is on"));
+    }
+
+    #[test]
+    fn list_parsing() {
+        assert_eq!(parse_list(" k6abc,w1*;\nk6abc  n0call "), ["K6ABC", "W1*", "N0CALL"]);
+        assert!(parse_list("  ").is_empty());
+    }
+
+    #[test]
+    fn old_config_files_still_load() {
+        let old = "callsign='K6ABC'\npassword='x'\nname='A'\nlocation='B'\n";
+        let c: Config = toml::from_str(old).unwrap();
+        assert!(c.qrz_key.is_none() && c.qrz_auto && !c.qrz_on_exit && c.log_band == "2m" && c.log_mode == "FM" && !c.dnd);
+    }
 }

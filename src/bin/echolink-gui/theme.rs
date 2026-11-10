@@ -345,33 +345,251 @@ pub fn dial(ui: &mut egui::Ui, marker: Option<f32>, lit: bool) {
     }
 }
 
-/// Segmented LED level meter: green, then amber, then red at the top end.
-pub fn led_meter(ui: &mut egui::Ui, label: &str, level: f32, active: bool) {
-    ui.horizontal(|ui| {
-        ui.add_sized([26.0, 16.0], egui::Label::new(silk(label)));
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 16.0), egui::Sense::hover());
-        let p = ui.painter();
-        p.rect_filled(rect, 2.0, screen());
-        p.rect_stroke(rect, 2.0, Stroke::new(1.0, edge()), StrokeKind::Inside);
-        let segs = 32usize;
-        let gap = 2.0;
-        let w = (rect.width() - 6.0 - gap * (segs as f32 - 1.0)) / segs as f32;
-        let lit = (level.clamp(0.0, 1.0) * segs as f32).round() as usize;
-        for i in 0..segs {
-            let x = rect.left() + 3.0 + i as f32 * (w + gap);
-            let seg = Rect::from_min_size(Pos2::new(x, rect.top() + 3.0), Vec2::new(w, rect.height() - 6.0));
-            let frac = i as f32 / segs as f32;
-            let on_color = if frac > 0.85 {
-                tx()
-            } else if frac > 0.65 {
-                warn()
-            } else {
-                rx()
-            };
-            let color = if i < lit && active { on_color } else { on_color.gamma_multiply(0.13) };
-            p.rect_filled(seg, 1.0, color);
+/// Where a gauge's needle is, with its held peak.
+#[derive(Clone, Copy, Default)]
+struct Needle {
+    pos: f32,
+    peak: f32,
+    peak_time: f64,
+    clip_until: f64,
+}
+
+/// What a gauge measures: its coloured zones, scale marks and lamp.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Scale {
+    /// Signal level: green, yellow where speech should peak, red for clipping. Lamp: clip.
+    Level,
+    /// Gain reduction, 0 to 12 dB. Lamp: on while Auto level is running.
+    Reduction,
+    /// Noise removed, 0 to 30 dB. Lamp: on while noise reduction is running.
+    Noise,
+    /// Connection quality, 0 to 100, higher is better. Lamp: on while linked.
+    Quality,
+}
+
+/// One gauge to draw.
+pub struct Gauge<'a> {
+    pub label: &'a str,
+    /// 0 to 1 along the scale.
+    pub value: f32,
+    pub scale: Scale,
+    /// The feature behind it is switched on; otherwise the needle rests and the face dims.
+    pub active: bool,
+}
+
+/// A small panel of figures that sits among the gauges.
+pub struct Card {
+    pub title: String,
+    pub title_color: Color32,
+    pub lines: Vec<(String, Color32)>,
+}
+
+pub enum Cell<'a> {
+    Gauge(Gauge<'a>),
+    Card(Card),
+}
+
+/// What happened in the grid this frame.
+#[derive(Default)]
+pub struct GridEvent {
+    /// A gauge was dragged from this position to that one.
+    pub moved: Option<(usize, usize)>,
+    /// "Reset gauge order" was chosen from a right-click menu.
+    pub reset: bool,
+}
+
+/// Gauges and cards packed tightly in rows, as many across as fit. Drag one onto
+/// another to rearrange; right-click to put them back.
+pub fn gauge_grid(ui: &mut egui::Ui, cells: &[Cell]) -> GridEvent {
+    let gap = 4.0;
+    let avail = ui.available_width();
+    let cols = (((avail + gap) / (165.0 + gap)).floor() as usize).clamp(2, cells.len().max(2));
+    let w = ((avail - gap * (cols as f32 - 1.0)) / cols as f32).clamp(110.0, 200.0);
+    // A meter face is about 1.8 wide to 1 tall.
+    let h = (w / 1.8).clamp(68.0, 104.0);
+    let size = Vec2::new(w, h);
+
+    let drag_id = egui::Id::new("gauge-drag");
+    let mut dragging: Option<usize> = ui.ctx().data(|d| d.get_temp(drag_id));
+    let mut rects: Vec<Rect> = Vec::with_capacity(cells.len());
+    let mut ev = GridEvent::default();
+
+    ui.spacing_mut().item_spacing = Vec2::splat(gap);
+    for (row_start, row) in cells.chunks(cols).enumerate().map(|(i, r)| (i * cols, r)) {
+        ui.horizontal(|ui| {
+            for (j, cell) in row.iter().enumerate() {
+                let i = row_start + j;
+                let resp = match cell {
+                    Cell::Gauge(g) => vu_gauge(ui, g, size),
+                    Cell::Card(c) => card(ui, c, size),
+                };
+                if resp.drag_started() {
+                    dragging = Some(i);
+                }
+                if resp.hovered() && dragging.is_none() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                }
+                resp.context_menu(|ui| {
+                    if ui.button("Reset gauge order").clicked() {
+                        ev.reset = true;
+                        ui.close_menu();
+                    }
+                });
+                rects.push(resp.rect);
+            }
+        });
+    }
+
+    if let Some(from) = dragging {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        let pointer = ui.ctx().pointer_interact_pos();
+        let target = pointer.and_then(|p| rects.iter().position(|r| r.contains(p)));
+        if let Some(r) = rects.get(from) {
+            ui.painter().rect_filled(*r, 6.0, Color32::from_black_alpha(90));
         }
+        if let Some(t) = target.filter(|&t| t != from) {
+            ui.painter().rect_stroke(rects[t].shrink(1.0), 6.0, Stroke::new(2.0, accent()), StrokeKind::Inside);
+        }
+        if ui.input(|i| i.pointer.any_released()) {
+            if let Some(t) = target.filter(|&t| t != from) {
+                ev.moved = Some((from, t));
+            }
+            dragging = None;
+        }
+    }
+    ui.ctx().data_mut(|d| match dragging {
+        Some(i) => d.insert_temp(drag_id, i),
+        None => d.remove::<usize>(drag_id),
     });
+    ev
+}
+
+fn card(ui: &mut egui::Ui, c: &Card, size: Vec2) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+    let p = ui.painter().with_clip_rect(rect);
+    p.rect_filled(rect, 6.0, screen());
+    p.rect_stroke(rect, 6.0, Stroke::new(1.0, edge()), StrokeKind::Inside);
+    let k = (rect.height() / 76.0).clamp(0.9, 1.45);
+    p.text(Pos2::new(rect.left() + 10.0, rect.top() + 12.0 * k), egui::Align2::LEFT_CENTER, &c.title, FontId::new(13.0 * k, display()), c.title_color);
+    for (i, (text, color)) in c.lines.iter().enumerate() {
+        p.text(Pos2::new(rect.left() + 10.0, rect.top() + (29.0 + i as f32 * 14.0) * k), egui::Align2::LEFT_CENTER, text, FontId::new(11.0 * k, FontFamily::Monospace), *color);
+    }
+    resp
+}
+
+/// An old-school swing-needle gauge. The needle rises quickly and falls back slowly
+/// like a real meter, a marker holds the recent peak, and a lamp shows clipping or
+/// whether the feature is on.
+pub fn vu_gauge(ui: &mut egui::Ui, g: &Gauge, size: Vec2) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+    let ctx = ui.ctx().clone();
+    let id = egui::Id::new(("vu-gauge", g.label));
+    let now = ctx.input(|i| i.time);
+    let dt = ctx.input(|i| i.unstable_dt).clamp(0.001, 0.1);
+
+    let mut n: Needle = ctx.data_mut(|d| d.get_temp(id)).unwrap_or_default();
+    let target = if g.active { g.value.clamp(0.0, 1.0) } else { 0.0 };
+    let tau = if target > n.pos { 0.07 } else { 0.28 }; // quick up, slow down
+    n.pos += (target - n.pos) * (1.0 - (-dt / tau).exp());
+    if target >= n.peak {
+        n.peak = target;
+        n.peak_time = now;
+    } else if now - n.peak_time > 1.2 {
+        n.peak = (n.peak - 0.5 * dt).max(n.pos);
+    }
+    if g.scale == Scale::Level && target >= 0.98 {
+        n.clip_until = now + 1.5;
+    }
+    ctx.data_mut(|d| d.insert_temp(id, n));
+    if (n.pos - target).abs() > 0.002 || n.peak > n.pos + 0.002 {
+        ctx.request_repaint();
+    }
+
+    let dim = if g.active { 1.0 } else { 0.35 };
+    let p = ui.painter().with_clip_rect(rect);
+    p.rect_filled(rect, 6.0, screen());
+    p.rect_stroke(rect, 6.0, Stroke::new(1.0, edge()), StrokeKind::Inside);
+
+    // The needle pivots below the face; the face shows only the top of its swing.
+    let k = (rect.height() / 76.0).clamp(0.9, 1.45); // everything on the face grows with it
+    let span = 48f32.to_radians();
+    let pivot = Pos2::new(rect.center().x, rect.bottom() + rect.height() * 0.20);
+    let r = (rect.height() * 1.0).min(rect.width() * 0.64);
+    let at = |v: f32, radius: f32| {
+        let a = -span + 2.0 * span * v;
+        pivot + Vec2::new(a.sin(), -a.cos()) * radius
+    };
+    let arc = |from: f32, to: f32, radius: f32, color: Color32, width: f32| {
+        let steps = ((to - from) * 48.0).ceil().max(2.0) as usize;
+        let pts: Vec<Pos2> = (0..=steps).map(|i| at(from + (to - from) * i as f32 / steps as f32, radius)).collect();
+        p.add(egui::Shape::line(pts, Stroke::new(width, color.gamma_multiply(dim))));
+    };
+
+    // Coloured scale and its marks.
+    let (zones, marks): (&[(f32, f32, Color32)], &[(f32, &str)]) = match g.scale {
+        Scale::Level => (
+            &[(0.0, 0.65, rx()), (0.65, 0.85, warn()), (0.85, 1.0, tx())],
+            &[(0.1, "-20"), (0.25, "-12"), (0.5, "-6"), (0.7, "-3"), (1.0, "0")],
+        ),
+        Scale::Reduction => (
+            &[(0.0, 0.5, rx()), (0.5, 0.75, warn()), (0.75, 1.0, tx())],
+            &[(0.0, "0"), (0.25, "3"), (0.5, "6"), (0.75, "9"), (1.0, "12")],
+        ),
+        Scale::Noise => (&[(0.0, 1.0, rx())], &[(0.0, "0"), (0.33, "10"), (0.67, "20"), (1.0, "30")]),
+        Scale::Quality => (
+            &[(0.0, 0.4, tx()), (0.4, 0.7, warn()), (0.7, 1.0, rx())],
+            &[(0.0, "0"), (0.25, "25"), (0.5, "50"), (0.75, "75"), (1.0, "100")],
+        ),
+    };
+    for &(from, to, color) in zones {
+        arc(from, to, r, color, 3.5 * k);
+    }
+    for i in 0..=20 {
+        let v = i as f32 / 20.0;
+        let len = (if i % 5 == 0 { 8.0 } else { 4.0 }) * k;
+        p.line_segment([at(v, r - 3.0 * k), at(v, r - 3.0 * k - len)], Stroke::new(1.0, muted().gamma_multiply(dim)));
+    }
+    for &(v, text) in marks {
+        p.text(at(v, r - 19.0 * k), egui::Align2::CENTER_CENTER, text, FontId::new(8.5 * k, FontFamily::Monospace), muted().gamma_multiply(dim));
+    }
+    let unit = match g.scale {
+        Scale::Level => "",
+        Scale::Reduction => " dB",
+        Scale::Noise => " dB",
+        Scale::Quality => "",
+    };
+    p.text(
+        Pos2::new(rect.center().x, rect.bottom() - 9.0 * k),
+        egui::Align2::CENTER_CENTER,
+        if g.active { format!("{}{}", g.label, unit) } else { format!("{} OFF", g.label) },
+        FontId::new(13.0 * k, display()),
+        accent().gamma_multiply(dim.max(0.5)),
+    );
+
+    if g.active {
+        if n.peak > 0.02 {
+            p.line_segment([at(n.peak, r + 2.0 * k), at(n.peak, r + 7.0 * k)], Stroke::new(2.0, text().gamma_multiply(0.7)));
+        }
+        let tip = at(n.pos, r + 1.0);
+        p.line_segment([pivot + Vec2::splat(1.5), tip + Vec2::splat(1.5)], Stroke::new(2.0 * k, Color32::from_black_alpha(80)));
+        p.line_segment([pivot, tip], Stroke::new(1.6 * k, text()));
+    }
+
+    // Lamp: clipping for level gauges, "feature is on" for the others.
+    let lamp = Pos2::new(rect.right() - 11.0 * k, rect.top() + 11.0 * k);
+    let (lit, color) = match g.scale {
+        Scale::Level => (now < n.clip_until, tx()),
+        _ => (g.active, rx()),
+    };
+    if lit {
+        p.circle_filled(lamp, 7.0 * k, color.gamma_multiply(0.25));
+        if g.scale == Scale::Level {
+            ctx.request_repaint();
+        }
+    }
+    p.circle_filled(lamp, 3.5 * k, if lit { color } else { color.gamma_multiply(0.18) });
+    p.rect_filled(Rect::from_min_max(rect.min, Pos2::new(rect.max.x, rect.center().y - 8.0)), 6.0, Color32::from_white_alpha(7));
+    resp
 }
 
 /// A row of little swatches, one per theme. Returns the one clicked, if any.

@@ -144,6 +144,11 @@ pub enum AudioPort<'a> {
     Other,
 }
 
+/// The sequence number of a voice packet.
+pub fn voice_seq(p: &[u8]) -> Option<u16> {
+    (p.first() == Some(&0xC0) && p.len() >= 4 && p[1] == PT_GSM).then(|| u16::from_be_bytes([p[2], p[3]]))
+}
+
 pub fn parse_audio_port(p: &[u8]) -> AudioPort<'_> {
     if p.first() == Some(&0xC0) {
         if p.len() < 12 || p[1] != PT_GSM {

@@ -17,6 +17,44 @@ use std::time::{Duration, Instant};
 const ECHOTEST_NODE: u32 = 9999;
 const RESTART_ENV: &str = "ECHOLINK_GUI_RESTARTED";
 
+fn split_path() -> std::path::PathBuf {
+    echolink::config::path().with_file_name("gui-layout")
+}
+
+/// Saved window layout: the two dividers, and the order of the gauges.
+struct Layout {
+    top: f32,
+    audio: f32,
+    gauges: Vec<usize>,
+}
+
+const GAUGES: usize = 6; // RX, MIC, LINK, COMP, NR, link details
+
+fn default_gauge_order() -> Vec<usize> {
+    (0..GAUGES).collect()
+}
+
+impl Layout {
+    fn load() -> Layout {
+        let text = std::fs::read_to_string(split_path()).unwrap_or_default();
+        let mut lines = text.lines();
+        let mut nums = lines.next().unwrap_or("").split_whitespace().filter_map(|t| t.parse::<f32>().ok()).map(|v| v.clamp(0.05, 0.9));
+        let (top, audio) = (nums.next().unwrap_or(0.30), nums.next().unwrap_or(0.32));
+        let mut gauges: Vec<usize> = lines.next().unwrap_or("").split_whitespace().filter_map(|t| t.parse().ok()).collect();
+        let mut sorted = gauges.clone();
+        sorted.sort();
+        if sorted != default_gauge_order() {
+            gauges = default_gauge_order(); // missing, damaged or from another version
+        }
+        Layout { top, audio, gauges }
+    }
+
+    fn save(&self) {
+        let order: Vec<String> = self.gauges.iter().map(|g| g.to_string()).collect();
+        let _ = std::fs::write(split_path(), format!("{:.3} {:.3}\n{}\n", self.top, self.audio, order.join(" ")));
+    }
+}
+
 fn main() -> eframe::Result {
     echolink::log::init();
     let options = eframe::NativeOptions {
@@ -31,6 +69,70 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native("EchoLink", options, Box::new(|cc| Ok(Box::new(Gui::new(cc)))))
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    Station,
+    Logbook,
+}
+
+/// The open QRZ profile window.
+struct PageWin {
+    call: String,
+    state: PageState,
+    rx: Option<std::sync::mpsc::Receiver<Result<echolink::lookup::Page, String>>>,
+    /// The photo, shared so it isn't copied every frame.
+    photo: Option<Arc<[u8]>>,
+}
+
+/// What to do after drawing the QRZ page.
+#[derive(Default)]
+struct PageActions {
+    connect: Option<String>,
+    block: Option<String>,
+    close: bool,
+}
+
+impl PageActions {
+    fn merge(&mut self, o: PageActions) {
+        self.connect = self.connect.take().or(o.connect);
+        self.block = self.block.take().or(o.block);
+        self.close |= o.close;
+    }
+}
+
+/// The "Edit contact" dialog.
+struct EditForm {
+    key: String,
+    /// The contact's id when it was made in this app; `None` for one that came from QRZ.
+    local_id: Option<String>,
+    on_qrz: bool,
+    /// Adding a new contact by hand rather than editing one.
+    adding: bool,
+    echolink: bool,
+    call: String,
+    name: String,
+    date: String,
+    time: String,
+    duration: String,
+    band: String,
+    mode: String,
+    error: String,
+}
+
+/// The "Delete contact" confirmation.
+struct DelForm {
+    key: String,
+    call: String,
+    when: String,
+    on_qrz: bool,
+}
+
+enum PageState {
+    Loading,
+    Ready(Box<echolink::lookup::Page>),
+    Failed(String),
 }
 
 struct Gui {
@@ -55,6 +157,28 @@ struct Gui {
     /// Result of the last auto-set, shown under the mic controls.
     mic_note: String,
     keypad_open: bool,
+    tab: Tab,
+    page: Option<PageWin>,
+    /// The selected logbook entry (its key), and the edit / delete dialogs.
+    book_sel: Option<String>,
+    edit: Option<EditForm>,
+    del: Option<DelForm>,
+    /// Shares of the right-hand column given to the readout and to the audio section (0..1);
+    /// the logbook gets the rest. Both are set by dragging the dividers.
+    split: f32,
+    split2: f32,
+    /// Which gauge is shown where; changed by dragging them.
+    gauge_order: Vec<usize>,
+    /// When the search box last changed, and the last callsign it looked up.
+    search_at: Option<Instant>,
+    search_looked: String,
+    /// QRZ's session key, kept between lookups as QRZ asks.
+    qrz_session: Arc<std::sync::Mutex<Option<String>>>,
+    log_note: String,
+    book_search: String,
+    book_filtered: Vec<usize>,
+    /// What `book_filtered` was computed for: search text and logbook generation.
+    book_key: (String, u64),
     dtmf_input: String,
     /// True while the system-wide talk key is held (macOS).
     hotkey_down: Arc<AtomicBool>,
@@ -65,6 +189,7 @@ struct Gui {
 impl Gui {
     fn new(cc: &eframe::CreationContext) -> Gui {
         theme::install(&cc.egui_ctx);
+        egui_extras::install_image_loaders(&cc.egui_ctx);
         let mut gui = Gui {
             session: None,
             start_error: None,
@@ -84,6 +209,21 @@ impl Gui {
             clip_until: None,
             mic_note: String::new(),
             keypad_open: false,
+            tab: Tab::Station,
+            page: None,
+            book_sel: None,
+            edit: None,
+            del: None,
+            split: Layout::load().top,
+            split2: Layout::load().audio,
+            gauge_order: Layout::load().gauges,
+            search_at: None,
+            search_looked: String::new(),
+            qrz_session: Arc::default(),
+            log_note: String::new(),
+            book_search: String::new(),
+            book_filtered: Vec::new(),
+            book_key: (String::from("\u{0}"), 0),
             dtmf_input: String::new(),
             hotkey_down: Arc::new(AtomicBool::new(false)),
             #[cfg(target_os = "macos")]
@@ -161,6 +301,669 @@ impl Gui {
         self.visible = v;
     }
 
+    /// The logbook tab: your QRZ logbook and the contacts made here, searchable,
+    /// with sync, ADIF export and redial.
+    /// The logbook with the QRZ page beside it, once a callsign has been looked up.
+    fn logbook_tab(&mut self, ui: &mut egui::Ui) {
+        // The room below the divider; drag the divider to give the logbook more or less.
+        let height = ui.available_height().max(120.0);
+        let width = ui.available_width();
+        ui.allocate_ui(egui::vec2(width, height), |ui| self.logbook_split(ui));
+    }
+
+    fn logbook_split(&mut self, ui: &mut egui::Ui) {
+        if self.page.is_some() {
+            let mut actions = PageActions::default();
+            egui::SidePanel::right("qrz-pane")
+                .resizable(true)
+                .default_width((ui.available_width() * 0.45).clamp(280.0, 420.0))
+                .min_width(240.0)
+                .max_width((ui.available_width() * 0.7).max(260.0))
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::screen())
+                        .stroke(egui::Stroke::new(1.0, theme::edge()))
+                        .corner_radius(4)
+                        .inner_margin(egui::Margin::symmetric(10, 8)),
+                )
+                .show_inside(ui, |ui| {
+                    let call = self.page.as_ref().map(|p| p.call.clone()).unwrap_or_default();
+                    ui.horizontal(|ui| {
+                        ui.label(theme::silk("QRZ"));
+                        ui.label(theme::data(&call, 14.0).color(theme::accent()));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("CLOSE").clicked() {
+                                actions.close = true;
+                            }
+                        });
+                    });
+                    ui.separator();
+                    actions.merge(self.page_body(ui));
+                });
+            self.apply_page_actions(actions);
+        }
+        egui::CentralPanel::default().frame(egui::Frame::new()).show_inside(ui, |ui| self.logbook_main(ui));
+    }
+
+    /// STATION LOG | LOGBOOK.
+    fn tab_row(tab: &mut Tab, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(tab, Tab::Station, theme::silk("STATION LOG"));
+            ui.selectable_value(tab, Tab::Logbook, theme::silk("LOGBOOK"));
+        });
+    }
+
+    fn logbook_main(&mut self, ui: &mut egui::Ui) {
+        use echolink::contacts::{Qrz, duration_label, utc_label};
+        use echolink::logbook::EntryState;
+        use echolink::session::SyncState;
+        let Some(s) = &self.session else { return };
+        let (mut sync, mut full, mut export, mut upload, mut add) = (false, false, false, false, false);
+        let mut info: Option<String> = None;
+
+        let has_key = s.qrz_key().is_some();
+        let running = matches!(s.sync, SyncState::Running(_));
+        let waiting = s.contacts.iter().filter(|c| c.is_qso() && matches!(c.qrz, Qrz::Pending | Qrz::Failed(_))).count();
+        ui.horizontal_wrapped(|ui| {
+            sync = ui
+                .add_enabled(has_key && !running, egui::Button::new(if running { "SYNCING…" } else { "SYNC FROM QRZ" }))
+                .on_hover_text("Copies your QRZ logbook here so you can see who you've worked before")
+                .clicked();
+            full = ui
+                .add_enabled(has_key && !running, egui::Button::new("FULL RE-SYNC").small())
+                .on_hover_text("Downloads everything again and removes contacts you deleted on QRZ")
+                .clicked();
+            add = ui.button("+ ADD CONTACT").on_hover_text("Log a contact by hand").clicked();
+            export = ui.button("EXPORT ADIF").on_hover_text("Saves an .adi file in Documents that any logging program can import").clicked();
+            upload = ui
+                .add_enabled(has_key && waiting > 0, egui::Button::new(format!("SEND {waiting} TO QRZ")).small())
+                .on_hover_text("Contacts made here that QRZ doesn't have yet")
+                .clicked();
+        });
+        let status = match &s.sync {
+            _ if !has_key => "Add your QRZ logbook key in Settings to sync.".to_string(),
+            SyncState::Running(n) => format!("Syncing with QRZ… {n} new so far"),
+            SyncState::Done { new, total } => format!("Synced: {total} contacts ({new} new)"),
+            SyncState::Failed(e) => format!("Sync stopped: {e}"),
+            SyncState::Idle if s.last_sync.is_none() => "Not synced yet. Press SYNC FROM QRZ to copy your logbook here.".to_string(),
+            SyncState::Idle => format!("{} contacts", s.book.len()),
+        };
+        let when = s.last_sync.map(|t| format!("  ·  last sync {} UTC", utc_label(t))).unwrap_or_default();
+        let color = if matches!(s.sync, SyncState::Failed(_)) { theme::tx() } else { theme::muted() };
+        ui.label(RichText::new(format!("{status}{when}")).small().color(color));
+        if !self.log_note.is_empty() {
+            ui.label(RichText::new(&self.log_note).small().color(theme::accent()));
+        }
+
+        ui.horizontal(|ui| {
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut self.book_search)
+                    .hint_text("search, or type a callsign to see its QRZ page")
+                    .desired_width((ui.available_width() - 140.0).clamp(110.0, 290.0)),
+            );
+            if r.changed() {
+                self.search_at = Some(Instant::now());
+            }
+            if ui.add_enabled(!self.book_search.is_empty(), egui::Button::new("CLR")).on_hover_text("Clear the search").clicked() {
+                self.book_search.clear();
+                self.search_at = None;
+                self.search_looked.clear(); // so typing the same callsign again looks it up again
+                r.request_focus();
+            }
+            // A callsign typed in gets looked up once you pause (or press Enter), not on every key.
+            let typed = self.book_search.trim().to_uppercase();
+            let callish = echolink::lookup::looks_like_call(&typed);
+            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let paused = self.search_at.is_some_and(|t| t.elapsed() >= Duration::from_millis(700));
+            if callish && typed != self.search_looked && (enter || (paused && typed.len() >= 4)) {
+                info = Some(typed.clone());
+            }
+            if paused {
+                self.search_at = None;
+            } else if self.search_at.is_some() {
+                ui.ctx().request_repaint_after(Duration::from_millis(250));
+            }
+            ui.label(RichText::new(format!("{} of {}", self.book_filtered.len(), s.book.len())).small().color(theme::muted()));
+        });
+        let (mut edit_req, mut del_req, mut sel_req, mut restore) = (None::<String>, None::<String>, None::<String>, false);
+        ui.horizontal(|ui| {
+            match self.book_sel.as_ref().and_then(|k| s.book.iter().find(|e| &e.key == k)) {
+                Some(e) => {
+                    ui.label(RichText::new(format!("{}  {}", e.call, echolink::contacts::date_str(e.when))).monospace().size(12.5).color(theme::accent()));
+                    if ui.small_button("EDIT").on_hover_text("Change this contact").clicked() {
+                        edit_req = Some(e.key.clone());
+                    }
+                    if ui.small_button("DELETE").on_hover_text("Remove this contact").clicked() {
+                        del_req = Some(e.key.clone());
+                    }
+                }
+                None => {
+                    ui.label(RichText::new("Click a contact to look it up, edit it or delete it.").small().color(theme::muted()));
+                }
+            }
+            if !s.hidden.is_empty() && ui.small_button(format!("RESTORE {} HIDDEN", s.hidden.len())).on_hover_text("Contacts you removed here only. Restoring lets a full re-sync bring them back.").clicked() {
+                restore = true;
+            }
+        });
+        let key = (self.book_search.trim().to_uppercase(), s.book_gen);
+        if key != self.book_key {
+            self.book_filtered = s
+                .book
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| key.0.is_empty() || e.call.to_uppercase().contains(&key.0) || e.name.to_uppercase().contains(&key.0))
+                .map(|(i, _)| i)
+                .collect();
+            self.book_key = key;
+        }
+
+        ui.add_space(4.0);
+        let table_height = ui.available_height().max(120.0);
+        // Squeezed beside the QRZ page, keep what matters: when, who, name, and whether QRZ has it.
+        let compact = ui.available_width() < 540.0;
+        let selected = self.book_sel.clone();
+        let mut table = TableBuilder::new(ui)
+            .striped(true)
+            .sense(egui::Sense::click())
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::exact(if compact { 104.0 } else { 112.0 }))
+            .column(Column::exact(96.0));
+        table = if compact {
+            table.column(Column::remainder().clip(true)).column(Column::exact(58.0))
+        } else {
+            table
+                .column(Column::initial(120.0).clip(true))
+                .column(Column::exact(70.0))
+                .column(Column::exact(52.0))
+                .column(Column::remainder().clip(true))
+        };
+        table
+            .max_scroll_height(table_height)
+            .header(22.0, |mut h| {
+                let heads: &[&str] = if compact { &["UTC", "Station", "Name", "QRZ"] } else { &["UTC", "Station", "Name", "Band/Mode", "Time", "QRZ"] };
+                for t in heads {
+                    h.col(|ui| {
+                        ui.label(theme::silk(t));
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(24.0, self.book_filtered.len(), |mut row| {
+                    let e = &s.book[self.book_filtered[row.index()]];
+                    row.set_selected(selected.as_deref() == Some(e.key.as_str()));
+                    row.col(|ui| {
+                        ui.label(RichText::new(utc_label(e.when)).monospace().size(12.5));
+                    });
+                    row.col(|ui| {
+                        let who = if e.incoming { format!("{} (in)", e.call) } else { e.call.clone() };
+                        ui.label(RichText::new(who).monospace().color(theme::accent()));
+                    });
+                    row.col(|ui| {
+                        ui.label(RichText::new(&e.name).size(12.5));
+                    });
+                    if !compact {
+                        row.col(|ui| {
+                            ui.label(RichText::new(format!("{} {}", e.band, e.mode).trim()).small().color(theme::muted()));
+                        });
+                        row.col(|ui| {
+                            if let Some(secs) = e.secs {
+                                ui.label(RichText::new(duration_label(secs)).monospace().size(12.5));
+                            }
+                        });
+                    }
+                    row.col(|ui| {
+                        let (text, short, color) = match &e.state {
+                            EntryState::OnQrz => ("on QRZ".to_string(), "on QRZ", theme::rx()),
+                            EntryState::Local(Qrz::Sent(_)) => ("sent".to_string(), "sent", theme::rx()),
+                            EntryState::Local(Qrz::Failed(why)) => (format!("failed: {why}"), "failed", theme::tx()),
+                            EntryState::Local(_) => ("not sent".to_string(), "not sent", theme::muted()),
+                        };
+                        ui.label(RichText::new(if compact { short.to_string() } else { text.clone() }).small().color(color)).on_hover_text(text);
+                    });
+                    let resp = row.response();
+                    if resp.clicked() {
+                        sel_req = Some(e.key.clone());
+                        info = Some(e.call.clone());
+                    }
+                    resp.context_menu(|ui| {
+                        sel_req = Some(e.key.clone());
+                        if ui.button("Look up on QRZ").clicked() {
+                            info = Some(e.call.clone());
+                            ui.close_menu();
+                        }
+                        if ui.button("Edit…").clicked() {
+                            edit_req = Some(e.key.clone());
+                            ui.close_menu();
+                        }
+                        if ui.button("Delete…").clicked() {
+                            del_req = Some(e.key.clone());
+                            ui.close_menu();
+                        }
+                    });
+                });
+            });
+
+        if let Some(k) = sel_req {
+            self.book_sel = Some(k);
+        }
+        if add {
+            self.open_add();
+        }
+        if let Some(k) = edit_req {
+            self.open_edit(&k);
+        }
+        if let Some(k) = del_req {
+            self.open_delete(&k);
+        }
+        let Some(s) = &mut self.session else { return };
+        if restore {
+            s.restore_hidden();
+        }
+        if sync || full {
+            s.sync_qrz(full);
+            self.log_note.clear();
+        }
+        if upload {
+            let n = s.upload_pending();
+            self.log_note = format!("Sending {n} contact(s) to QRZ…");
+        }
+        if export {
+            self.log_note = match s.export_adif() {
+                Ok(path) => {
+                    let _ = std::process::Command::new("open").arg("-R").arg(&path).spawn(); // show it in Finder
+                    format!("Saved {}", path.display())
+                }
+                Err(e) => format!("Couldn't save the file: {e}"),
+            };
+        }
+        if let Some(call) = info {
+            let ctx = ui.ctx().clone();
+            self.start_lookup(&ctx, &call);
+        }
+    }
+
+    fn open_edit(&mut self, key: &str) {
+        let Some(s) = &self.session else { return };
+        let Some(e) = s.book.iter().find(|e| e.key == key) else { return };
+        let local = key.strip_prefix("L:").and_then(|id| s.contacts.iter().find(|c| c.id() == id));
+        self.edit = Some(match local {
+            Some(c) => EditForm {
+                key: key.to_string(),
+                local_id: Some(c.id()),
+                on_qrz: e.logid.is_some(),
+                adding: false,
+                echolink: c.echolink,
+                call: c.call.clone(),
+                name: c.name.clone(),
+                date: echolink::contacts::date_str(c.start),
+                time: echolink::contacts::time_str(c.start),
+                duration: echolink::contacts::duration_label(c.secs),
+                band: c.band.clone().unwrap_or_else(|| s.cfg.log_band.clone()),
+                mode: c.mode.clone().unwrap_or_else(|| s.cfg.log_mode.clone()),
+                error: String::new(),
+            },
+            None => EditForm {
+                key: key.to_string(),
+                local_id: None,
+                on_qrz: true,
+                adding: false,
+                echolink: true,
+                call: e.call.clone(),
+                name: e.name.clone(),
+                date: echolink::contacts::date_str(e.when),
+                time: echolink::contacts::time_str(e.when),
+                duration: String::new(),
+                band: e.band.clone(),
+                mode: e.mode.clone(),
+                error: String::new(),
+            },
+        });
+    }
+
+    /// A blank "Add contact" form, set to now.
+    fn open_add(&mut self) {
+        let Some(s) = &self.session else { return };
+        let now = echolink::contacts::now();
+        self.edit = Some(EditForm {
+            key: String::new(),
+            local_id: None,
+            on_qrz: false,
+            adding: true,
+            echolink: true,
+            call: String::new(),
+            name: String::new(),
+            date: echolink::contacts::date_str(now),
+            time: echolink::contacts::time_str(now)[..5].to_string(),
+            duration: "5:00".into(),
+            band: s.cfg.log_band.clone(),
+            mode: s.cfg.log_mode.clone(),
+            error: String::new(),
+        });
+    }
+
+    fn open_delete(&mut self, key: &str) {
+        let Some(s) = &self.session else { return };
+        let Some(e) = s.book.iter().find(|e| e.key == key) else { return };
+        self.del = Some(DelForm {
+            key: key.to_string(),
+            call: e.call.clone(),
+            when: echolink::contacts::utc_label(e.when),
+            on_qrz: e.logid.is_some(),
+        });
+    }
+
+    /// Edit a contact made in this app. Contacts that came from QRZ are edited on QRZ.
+    fn edit_dialog(&mut self, ctx: &egui::Context) {
+        let Some(f) = &mut self.edit else { return };
+        let (mut close, mut save) = (false, false);
+        let title = if f.adding { "Add contact" } else { "Edit contact" };
+        egui::Window::new(title).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+            ui.set_width(360.0);
+            if f.local_id.is_none() && !f.adding {
+                ui.label(format!("{} is in your QRZ logbook.", f.call));
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "QRZ keeps more about a contact than shows here (signal reports, notes, confirmations). Saving a copy from this app would wipe those, so contacts that came from QRZ are edited on QRZ. Then press SYNC FROM QRZ to bring the changes here.",
+                    )
+                    .small()
+                    .color(theme::muted()),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("OPEN QRZ LOGBOOK").clicked() {
+                        let _ = std::process::Command::new("open").arg(echolink::qrz::LOGBOOK_URL).spawn();
+                    }
+                    if ui.button("CLOSE").clicked() {
+                        close = true;
+                    }
+                });
+                return;
+            }
+            egui::Grid::new("edit-contact").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                let mut field = |ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str, width: f32| {
+                    ui.label(label);
+                    ui.add(egui::TextEdit::singleline(value).hint_text(hint).desired_width(width));
+                    ui.end_row();
+                };
+                field(ui, "Station", &mut f.call, "K6ABC", 140.0);
+                field(ui, "Name", &mut f.name, "", 220.0);
+                field(ui, "Date (UTC)", &mut f.date, "2026-11-09", 110.0);
+                field(ui, "Time (UTC)", &mut f.time, "18:04 or 18:04:09", 130.0);
+                field(ui, "Length", &mut f.duration, "12:30", 90.0);
+                field(ui, "Band", &mut f.band, "2m", 70.0);
+                field(ui, "Mode", &mut f.mode, "FM", 70.0);
+                ui.label("");
+                ui.checkbox(&mut f.echolink, "EchoLink contact");
+                ui.end_row();
+            });
+            if !f.echolink {
+                ui.label(RichText::new("Not tagged as EchoLink in the ADIF, for a contact made another way.").small().color(theme::muted()));
+            }
+            if f.on_qrz {
+                ui.add_space(4.0);
+                ui.label(RichText::new("This contact is on QRZ. Saving uploads the edited version and then removes the old copy from QRZ.").small().color(theme::muted()));
+            }
+            if !f.error.is_empty() {
+                ui.colored_label(ui.visuals().error_fg_color, &f.error);
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                save = ui.button(if f.adding { "ADD" } else { "SAVE" }).clicked();
+                if ui.button("CANCEL").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if save {
+            let check = (|| {
+                let call = f.call.trim().to_uppercase();
+                if call.is_empty() || call.contains(char::is_whitespace) || call.len() > 24 {
+                    return Err("Enter the station's callsign.".to_string());
+                }
+                let start = echolink::contacts::parse_datetime(&f.date, &f.time).ok_or("Date must look like 2026-11-09 and time like 18:04 (UTC).")?;
+                let secs = echolink::contacts::parse_duration(&f.duration).ok_or("Length must look like 12:30 (minutes:seconds).")?;
+                if secs < echolink::contacts::MIN_QSO_SECS || call.starts_with('*') {
+                    return Err("Contacts shorter than 10 seconds, and conferences, aren't logged. Delete it instead.".to_string());
+                }
+                if f.band.trim().is_empty() || f.mode.trim().is_empty() {
+                    return Err("QRZ needs a band and a mode.".to_string());
+                }
+                Ok(echolink::session::ContactEdit { call, name: f.name.clone(), start, secs, band: f.band.clone(), mode: f.mode.clone(), echolink: f.echolink })
+            })();
+            match (check, &mut self.session) {
+                (Err(why), _) => f.error = why,
+                (Ok(e), Some(s)) => {
+                    let result = if f.adding {
+                        s.add_contact(e)
+                    } else if let Some(id) = &f.local_id {
+                        s.edit_contact(id, e)
+                    } else {
+                        Ok(())
+                    };
+                    match result {
+                        Ok(()) => close = true,
+                        Err(why) => f.error = why,
+                    }
+                }
+                _ => {}
+            }
+        }
+        if close {
+            self.edit = None;
+            self.book_sel = None; // the edited entry may have a new id
+        }
+    }
+
+    /// Confirm before anything is deleted, and say plainly what happens on QRZ.
+    fn delete_dialog(&mut self, ctx: &egui::Context) {
+        let Some(f) = &self.del else { return };
+        let has_key = self.session.as_ref().is_some_and(|s| s.qrz_key().is_some());
+        let (mut here, mut everywhere, mut cancel) = (false, false, false);
+        egui::Window::new("Delete contact").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+            ui.set_width(380.0);
+            ui.label(RichText::new(format!("{}   {} UTC", f.call, f.when)).monospace().color(theme::accent()));
+            ui.add_space(6.0);
+            if f.on_qrz {
+                ui.label("This contact is in your QRZ logbook. What do you want to do?");
+                ui.add_space(4.0);
+                ui.label(RichText::new("REMOVE FROM THIS APP ONLY hides it here. It stays on QRZ, and re-syncing won't bring it back.").small().color(theme::muted()));
+                ui.label(
+                    RichText::new("DELETE FROM QRZ TOO deletes it from your QRZ logbook for good. QRZ has no undo.").small().color(theme::tx()),
+                );
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    here = ui.button("REMOVE FROM THIS APP ONLY").clicked();
+                    everywhere = ui
+                        .add_enabled(has_key, egui::Button::new(RichText::new("DELETE FROM QRZ TOO").color(theme::tx())))
+                        .on_disabled_hover_text("Add your QRZ logbook key in Settings first")
+                        .clicked();
+                    cancel = ui.button("CANCEL").clicked();
+                });
+            } else {
+                ui.label("Delete this contact from your logbook? It also leaves the ADIF export. This can't be undone.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    here = ui.button(RichText::new("DELETE").color(theme::tx())).clicked();
+                    cancel = ui.button("CANCEL").clicked();
+                });
+            }
+        });
+        let key = f.key.clone();
+        if here || everywhere {
+            if let Some(s) = &mut self.session {
+                s.delete_entry(&key, everywhere);
+            }
+        }
+        if here || everywhere || cancel {
+            self.del = None;
+            self.book_sel = None;
+        }
+    }
+
+    /// Fetch a station's QRZ page in the background and open its window.
+    fn start_lookup(&mut self, ctx: &egui::Context, call: &str) {
+        let Some(s) = &self.session else { return };
+        let call = echolink::lookup::lookup_call(call);
+        self.search_looked = call.clone();
+        let (user, pass) = (s.cfg.qrz_user.clone().unwrap_or_default(), s.cfg.qrz_pass.clone().unwrap_or_default());
+        if user.trim().is_empty() || pass.is_empty() {
+            let why = "To look up a callsign, add your QRZ username and password in Settings (under QRZ logbook, Lookups).";
+            self.page = Some(PageWin { call, state: PageState::Failed(why.into()), rx: None, photo: None });
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (session, repaint, who) = (self.qrz_session.clone(), ctx.clone(), call.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(echolink::lookup::Client::new(&user, &pass, session).lookup(&who));
+            repaint.request_repaint();
+        });
+        self.page = Some(PageWin { call, state: PageState::Loading, rx: Some(rx), photo: None });
+    }
+
+    /// Pick up the QRZ answer when it arrives.
+    fn poll_page(&mut self) {
+        let Some(win) = &mut self.page else { return };
+        if let Some(rx) = &win.rx
+            && let Ok(answer) = rx.try_recv()
+        {
+            win.rx = None;
+            win.state = match answer {
+                Ok(page) => {
+                    win.photo = page.image.as_ref().map(|b| Arc::from(b.as_slice()));
+                    PageState::Ready(Box::new(page))
+                }
+                Err(e) => PageState::Failed(e),
+            };
+        }
+    }
+
+    fn apply_page_actions(&mut self, a: PageActions) {
+        if a.close {
+            self.page = None;
+        }
+        if let Some(s) = &mut self.session {
+            if let Some(c) = a.connect {
+                s.connect_call(&c);
+            }
+            if let Some(c) = a.block {
+                s.block(&c);
+            }
+        }
+    }
+
+    /// What's on someone's QRZ page, plus your history with them.
+    fn page_body(&mut self, ui: &mut egui::Ui) -> PageActions {
+        let mut actions = PageActions::default();
+        let (Some(win), Some(s)) = (&self.page, &self.session) else { return actions };
+        let call = win.call.clone();
+        let web = format!("https://www.qrz.com/db/{call}");
+        match &win.state {
+            PageState::Loading => {
+                ui.add_space(20.0);
+                ui.label(RichText::new("Asking QRZ…").color(theme::accent()));
+            }
+            PageState::Failed(why) => {
+                ui.add_space(8.0);
+                ui.colored_label(ui.visuals().error_fg_color, why);
+            }
+            PageState::Ready(p) => {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).max_height((ui.available_height() - 44.0).max(120.0)).show(ui, |ui| {
+                    ui.horizontal_top(|ui| {
+                        if let Some(photo) = &win.photo {
+                            ui.add(egui::Image::from_bytes(format!("bytes://qrz-{call}"), photo.clone()).max_width(150.0).max_height(200.0).corner_radius(4));
+                        }
+                        ui.vertical(|ui| {
+                            ui.label(theme::head(p.get("call"), 24.0).color(theme::accent()));
+                            let name = p.full_name();
+                            if !name.is_empty() {
+                                ui.label(RichText::new(name).size(15.0));
+                            }
+                            for line in p.address() {
+                                ui.label(RichText::new(line).color(theme::text().gamma_multiply(0.9)));
+                            }
+                        });
+                    });
+                    if let Some(n) = &p.notice {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(n).small().color(theme::tx()));
+                    }
+                    ui.add_space(6.0);
+                    egui::Grid::new("qrz-fields").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+                        let mut row = |label: &str, value: String| {
+                            if !value.trim().is_empty() {
+                                ui.label(theme::silk(label));
+                                ui.label(RichText::new(value).monospace().size(12.5));
+                                ui.end_row();
+                            }
+                        };
+                        row("Class", p.get("class").to_string());
+                        let lic = [p.get("efdate"), p.get("expdate")];
+                        row("Licensed", if lic[0].is_empty() && lic[1].is_empty() { String::new() } else { format!("{} to {}", lic[0], lic[1]) });
+                        row("Also known as", p.get("aliases").to_string());
+                        row("Previous call", p.get("p_call").to_string());
+                        row("Grid", p.get("grid").to_string());
+                        row("County", p.get("county").to_string());
+                        row("Country", p.get("land").to_string());
+                        row("Lat / Lon", if p.get("lat").is_empty() { String::new() } else { format!("{}, {}", p.get("lat"), p.get("lon")) });
+                        row("CQ / ITU zone", if p.get("cqzone").is_empty() { String::new() } else { format!("{} / {}", p.get("cqzone"), p.get("ituzone")) });
+                        row("QSL manager", p.get("qslmgr").to_string());
+                        row("eQSL / LoTW / paper", [p.get("eqsl"), p.get("lotw"), p.get("mqsl")].iter().map(|v| if v.is_empty() { "?" } else { v }).collect::<Vec<_>>().join(" / "));
+                        row("Email", p.get("email").to_string());
+                        row("QRZ page views", p.get("u_views").to_string());
+                        row("Born", p.get("born").to_string());
+                        row("Updated", p.get("moddate").to_string());
+                    });
+                    let site = p.get("url");
+                    if site.starts_with("https://") || site.starts_with("http://") {
+                        ui.add_space(4.0);
+                        if ui.link(site).on_hover_text("Open in your browser").clicked() {
+                            let _ = std::process::Command::new("open").arg(site).spawn();
+                        }
+                    }
+
+                    // What you've done with them.
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.label(theme::silk("YOUR HISTORY WITH THEM"));
+                    let who = echolink::logbook::norm(&call);
+                    match s.worked.get(&who) {
+                        Some(w) => {
+                            ui.label(format!("Worked {} time{}; last {} UTC", w.count, if w.count == 1 { "" } else { "s" }, echolink::contacts::utc_label(w.last)));
+                            for e in s.book.iter().filter(|e| echolink::logbook::norm(&e.call) == who).take(8) {
+                                ui.label(RichText::new(format!("{}  {} {}", echolink::contacts::utc_label(e.when), e.band, e.mode)).monospace().size(12.0).color(theme::muted()));
+                            }
+                        }
+                        None => {
+                            ui.label(RichText::new("Not in your logbook yet.").color(theme::muted()));
+                        }
+                    }
+
+                    if let Some(bio) = &p.bio {
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.label(theme::silk("BIO"));
+                        ui.label(RichText::new(bio).size(13.0));
+                    }
+                });
+            }
+        }
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("OPEN ON QRZ.COM").clicked() && echolink::lookup::looks_like_call(&call) {
+                let _ = std::process::Command::new("open").arg(&web).spawn();
+            }
+            let online = [call.clone(), format!("{call}-R"), format!("{call}-L")].into_iter().find(|c| s.find(c).is_some());
+            if ui.add_enabled(online.is_some(), egui::Button::new("CONNECT")).on_hover_text("Call them on EchoLink if they're online").clicked() {
+                actions.connect = online;
+            }
+            if ui.button("BLOCK").on_hover_text("Never accept calls from them").clicked() {
+                actions.block = Some(call.clone());
+            }
+        });
+        actions
+    }
+
     /// Save the mic settings onto whatever is on disk.
     fn save_mic_settings(&mut self) {
         let Some(s) = &mut self.session else { return };
@@ -187,8 +990,55 @@ impl Gui {
         let shared = s.audio.shared.clone();
         let rx = shared.rx_level.load(Ordering::Relaxed) as f32 / 1000.0;
         let mic = shared.mic_level.load(Ordering::Relaxed) as f32 / 1000.0;
-        theme::led_meter(ui, "RX", rx, true);
-        theme::led_meter(ui, "MIC", mic, true);
+        let nr = shared.nr_db_x10.load(Ordering::Relaxed) as f32 / 10.0 / 30.0;
+        let comp = shared.comp_db_x10.load(Ordering::Relaxed) as f32 / 10.0 / 12.0;
+        // Connection health, from the other station's packets.
+        let linked = s.connected();
+        let age = shared.link_age_ms.load(Ordering::Relaxed) as f32 / 1000.0;
+        let voice_age = shared.link_voice_age_ms.load(Ordering::Relaxed);
+        let recent = voice_age != u32::MAX && voice_age < 20_000;
+        let loss = shared.link_loss_permille.load(Ordering::Relaxed) as f32 / 10.0;
+        let jitter = shared.link_jitter_x10.load(Ordering::Relaxed) as f32 / 10.0;
+        let quality = echolink::link::quality(age, loss, jitter, recent);
+        let grade_color = |q: f32| if q >= 0.8 { theme::rx() } else if q >= 0.5 { theme::warn() } else { theme::tx() };
+        let route = if s.cfg.proxy.is_some() { "via proxy" } else { "direct" };
+        let card = if linked {
+            let heard = if age < 1.5 { "just now".to_string() } else { format!("{age:.0} s ago") };
+            theme::Card {
+                title: format!("LINK {}", echolink::link::grade(quality)),
+                title_color: grade_color(quality),
+                lines: vec![
+                    (if shared.link_voice_age_ms.load(Ordering::Relaxed) == u32::MAX { "Loss -   Jitter -".to_string() } else { format!("Loss {loss:.1}%  Jitter {jitter:.0} ms") }, theme::text()),
+                    (format!("Heard {heard}"), theme::muted()),
+                    (route.to_string(), theme::muted()),
+                ],
+            }
+        } else {
+            theme::Card {
+                title: "LINK".into(),
+                title_color: theme::muted(),
+                lines: vec![("Not connected".to_string(), theme::muted()), (format!("Directory {}", s.dir_status.split(" · ").next().unwrap_or("")), theme::muted()), (route.to_string(), theme::muted())],
+            }
+        };
+        let mut by_id: Vec<Option<theme::Cell>> = vec![
+            Some(theme::Cell::Gauge(theme::Gauge { label: "RX", value: rx, scale: theme::Scale::Level, active: true })),
+            Some(theme::Cell::Gauge(theme::Gauge { label: "MIC", value: mic, scale: theme::Scale::Level, active: true })),
+            Some(theme::Cell::Gauge(theme::Gauge { label: "LINK", value: quality, scale: theme::Scale::Quality, active: linked })),
+            Some(theme::Cell::Gauge(theme::Gauge { label: "COMP", value: comp, scale: theme::Scale::Reduction, active: shared.auto_gain.load(Ordering::Relaxed) })),
+            Some(theme::Cell::Gauge(theme::Gauge { label: "NR", value: nr, scale: theme::Scale::Noise, active: shared.denoise.load(Ordering::Relaxed) })),
+            Some(theme::Cell::Card(card)),
+        ];
+        let cells: Vec<theme::Cell> = self.gauge_order.iter().filter_map(|&id| by_id.get_mut(id).and_then(Option::take)).collect();
+        let ev = theme::gauge_grid(ui, &cells);
+        if let Some((from, to)) = ev.moved {
+            let id = self.gauge_order.remove(from);
+            self.gauge_order.insert(to, id);
+            self.save_layout();
+        }
+        if ev.reset {
+            self.gauge_order = default_gauge_order();
+            self.save_layout();
+        }
 
         let clips = shared.clips.load(Ordering::Relaxed);
         if clips != self.last_clips {
@@ -353,7 +1203,7 @@ impl Gui {
         let Some(s) = &mut self.session else { return };
         echolink::log!("closing: disconnecting and logging off");
         s.quit();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(25); // log-off is quick; QRZ uploads can take a few seconds
         while std::time::Instant::now() < deadline {
             if s.poll() == Update::Finished {
                 echolink::log!("closing: logged off");
@@ -400,6 +1250,13 @@ impl eframe::App for Gui {
             self.refilter();
         }
         self.focused.store(ctx.input(|i| i.focused), Ordering::Relaxed);
+        if let Some(s) = &mut self.session
+            && s.incoming.take().is_some()
+            && !self.focused.load(Ordering::Relaxed)
+        {
+            // Bounce the Dock icon until you look.
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
+        }
 
         // Closing the window disconnects and logs off first.
         if ctx.input(|i| i.viewport().close_requested()) && !self.closing {
@@ -433,6 +1290,9 @@ impl eframe::App for Gui {
 
         self.top_bar(ctx);
         self.status_bar(ctx);
+        self.poll_page();
+        self.edit_dialog(ctx);
+        self.delete_dialog(ctx);
 
         if self.session.is_none() {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -469,7 +1329,7 @@ impl eframe::App for Gui {
             });
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.set_opacity(theme::reveal(ctx, "qso", 0.30));
-            self.qso_panel(ui)
+            self.qso_panel(ui);
         });
         self.handle_ptt(ctx);
     }
@@ -513,6 +1373,20 @@ impl Gui {
                         && ui.button("REFRESH LIST").clicked()
                     {
                         s.refresh();
+                    }
+                    if self.session.is_some() && ui.button("LOGBOOK").on_hover_text("Your contacts, QRZ sync and ADIF export").clicked() {
+                        self.tab = Tab::Logbook;
+                    }
+                    if let Some(s) = &mut self.session {
+                        let on = s.cfg.dnd;
+                        let label = RichText::new("DND").color(if on { theme::tx() } else { theme::text() });
+                        if ui
+                            .button(label)
+                            .on_hover_text("Do Not Disturb: refuse every incoming call")
+                            .clicked()
+                        {
+                            s.set_dnd(!on);
+                        }
                     }
                     ui.add_space(6.0);
                     if let Some(i) = theme::picker(ui) {
@@ -608,11 +1482,12 @@ impl Gui {
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .column(Column::exact(26.0))
             .column(Column::initial(118.0))
+            .column(Column::exact(40.0))
             .column(Column::initial(76.0))
             .column(Column::remainder().clip(true))
             .column(Column::exact(48.0))
             .header(24.0, |mut h| {
-                for t in ["", "Call", "Node", "Location", ""] {
+                for t in ["", "Call", "Wkd", "Node", "Location", ""] {
                     h.col(|ui| {
                         ui.label(theme::silk(t));
                     });
@@ -631,6 +1506,17 @@ impl Gui {
                     });
                     row.col(|ui| {
                         ui.label(theme::data(&st.callsign, 14.0).color(if is_fav { theme::accent() } else { theme::text() }));
+                    });
+                    row.col(|ui| {
+                        if let Some(w) = s.worked.get(&echolink::logbook::norm(&st.callsign)) {
+                            ui.label(RichText::new(format!("{}\u{d7}", w.count)).small().color(theme::accent_dim())).on_hover_text(format!(
+                                "You've worked {} {} time{}; last {} UTC",
+                                echolink::logbook::norm(&st.callsign),
+                                w.count,
+                                if w.count == 1 { "" } else { "s" },
+                                echolink::contacts::utc_label(w.last)
+                            ));
+                        }
                     });
                     row.col(|ui| {
                         ui.label(RichText::new(st.id.to_string()).monospace().size(12.5).color(theme::muted()));
@@ -667,7 +1553,59 @@ impl Gui {
         }
     }
 
+    /// The right-hand column in three sections with draggable dividers between them:
+    /// readout and talk key, audio, then the station log or logbook.
     fn qso_panel(&mut self, ui: &mut egui::Ui) {
+        let total = ui.available_height();
+        let width = ui.available_width();
+        let grip = 10.0;
+        let avail = (total - 2.0 * grip).max(1.0);
+        let (min_top, min_audio, min_bottom) = (90.0, 90.0, 150.0);
+        let top = (self.split * avail).clamp(min_top, (avail - min_audio - min_bottom).max(min_top));
+        let audio = (self.split2 * avail).clamp(min_audio, (avail - top - min_bottom).max(min_audio));
+
+        ui.allocate_ui(egui::vec2(width, top), |ui| {
+            egui::ScrollArea::vertical().id_salt("section-top").auto_shrink([false, false]).show(ui, |ui| self.qso_top(ui));
+        });
+        let (dy, stopped) = Gui::divider(ui, width, grip);
+        if dy != 0.0 {
+            self.split = ((top + dy) / avail).clamp(0.05, 0.9);
+        }
+
+        ui.allocate_ui(egui::vec2(width, audio), |ui| {
+            egui::ScrollArea::vertical().id_salt("section-audio").auto_shrink([false, false]).show(ui, |ui| self.qso_audio(ui));
+        });
+        let (dy2, stopped2) = Gui::divider(ui, width, grip);
+        if dy2 != 0.0 {
+            self.split2 = ((audio + dy2) / avail).clamp(0.05, 0.9);
+        }
+        if stopped || stopped2 {
+            self.save_layout();
+        }
+
+        self.qso_lower(ui);
+    }
+
+    fn save_layout(&self) {
+        Layout { top: self.split, audio: self.split2, gauges: self.gauge_order.clone() }.save();
+    }
+
+    /// A draggable divider. Returns how far it was dragged this frame, and whether the drag just ended.
+    fn divider(ui: &mut egui::Ui, width: f32, height: f32) -> (f32, bool) {
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::drag());
+        if resp.hovered() || resp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        }
+        let c = if resp.hovered() || resp.dragged() { theme::accent() } else { theme::edge() };
+        ui.painter().line_segment([egui::pos2(rect.left(), rect.center().y), egui::pos2(rect.right(), rect.center().y)], egui::Stroke::new(1.0, c.gamma_multiply(0.6)));
+        for dx in [-8.0, 0.0, 8.0] {
+            ui.painter().circle_filled(egui::pos2(rect.center().x + dx, rect.center().y), 1.8, c);
+        }
+        (if resp.dragged() { resp.drag_delta().y } else { 0.0 }, resp.drag_stopped())
+    }
+
+    /// Readout, connect row and talk key.
+    fn qso_top(&mut self, ui: &mut egui::Ui) {
         let selected = self.selected_station().cloned();
         let Some(s) = &mut self.session else { return };
         ui.add_space(6.0);
@@ -756,20 +1694,43 @@ impl Gui {
             if ui.button("ECHOTEST").on_hover_text("Records what you say and plays it back").clicked() {
                 s.connect_node(ECHOTEST_NODE);
             }
+            let recent: Vec<String> = s.recent(10).iter().map(|c| c.call.clone()).collect();
+            if !recent.is_empty() {
+                let mut pick = None;
+                egui::ComboBox::from_id_salt("recent").selected_text("RECENT").width(120.0).show_ui(ui, |ui| {
+                    for call in &recent {
+                        if ui.selectable_label(false, call).clicked() {
+                            pick = Some(call.clone());
+                        }
+                    }
+                });
+                if let Some(call) = pick {
+                    s.connect_call(&call);
+                }
+            }
         });
 
         ui.add_space(10.0);
         self.ptt_button(ui);
 
-        // Audio meters and mic controls.
-        ui.add_space(8.0);
-        self.audio_panel(ui);
-        self.keypad(ui);
-        let Some(s) = &self.session else { return };
+    }
 
-        // Messages and chat.
-        ui.add_space(10.0);
-        ui.label(theme::silk("Station log"));
+    /// Gauges, mic and speaker controls, and the DTMF keypad.
+    fn qso_audio(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        egui::CollapsingHeader::new(theme::silk("AUDIO")).default_open(true).show(ui, |ui| self.audio_panel(ui));
+        self.keypad(ui);
+    }
+
+    /// Station log and chat, or the logbook.
+    fn qso_lower(&mut self, ui: &mut egui::Ui) {
+        let Some(s) = &self.session else { return };
+        ui.add_space(4.0);
+        Gui::tab_row(&mut self.tab, ui);
+        if self.tab == Tab::Logbook {
+            self.logbook_tab(ui);
+            return;
+        }
         let log_height = (ui.available_height() - 40.0).max(60.0);
         egui::Frame::new().fill(theme::screen()).stroke(egui::Stroke::new(1.0, theme::edge())).corner_radius(3).inner_margin(8).show(ui, |ui| {
             egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).max_height(log_height).show(ui, |ui| {

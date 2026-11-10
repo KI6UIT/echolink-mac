@@ -305,6 +305,18 @@ pub struct Shared {
     pub volume_x100: AtomicU32,
     /// Keep the microphone out of the transmission (while DTMF tones play).
     pub mute_mic: AtomicBool,
+    /// How much quieter the noise reduction is making the mic, in tenths of a dB.
+    pub nr_db_x10: AtomicU32,
+    /// How far Auto level is pulling the peaks down, in tenths of a dB.
+    pub comp_db_x10: AtomicU32,
+    /// Connection health, measured from the other station's packets (see `link`):
+    /// lost packets in tenths of a percent, jitter in tenths of a millisecond,
+    /// milliseconds since anything came from them, and since a voice packet did
+    /// (`u32::MAX` if none yet on this connection).
+    pub link_loss_permille: AtomicU32,
+    pub link_jitter_x10: AtomicU32,
+    pub link_age_ms: AtomicU32,
+    pub link_voice_age_ms: AtomicU32,
     cal: Mutex<Calibrator>,
 }
 
@@ -446,6 +458,7 @@ pub fn open(
     let host = cpal::default_host();
     let shared = Arc::new(Shared::default());
     shared.volume_x100.store(100, Ordering::Relaxed);
+    shared.link_voice_age_ms.store(u32::MAX, Ordering::Relaxed);
     let mut notes = Vec::new();
 
     let indev = choose(&host, input_name, true, &mut notes)?;
@@ -475,6 +488,7 @@ pub fn open(
         let smooth = 1.0 / (0.01 * WORK as f32); // gain changes glide over ~10 ms
         let mut agc = Agc::new(WORK);
         let mut denoiser: Option<Denoiser> = None;
+        let (mut nr_smooth, mut comp_smooth) = (0.0f32, 0.0f32);
         let mut handle = move |data: &mut dyn Iterator<Item = f32>| {
             mono.clear();
             let mut acc = 0.0;
@@ -503,16 +517,32 @@ pub fn open(
                 *s *= gain;
             }
             // Noise removal goes before auto level, so the AGC never boosts room noise.
-            if shared.denoise.load(Ordering::Relaxed) {
+            let rms = |v: &[f32]| (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
+            let nr_target = if shared.denoise.load(Ordering::Relaxed) {
+                let before = rms(&mono);
                 denoiser.get_or_insert_with(Denoiser::new).process(&mut mono);
+                let after = rms(&mono);
+                // How much quieter it got; unchanged when there is nothing to measure.
+                if before > 0.0005 { (20.0 * (before / after.max(1e-6)).log10()).clamp(0.0, 40.0) } else { nr_smooth }
             } else {
                 denoiser = None;
-            }
-            if shared.auto_gain.load(Ordering::Relaxed) {
+                0.0
+            };
+            nr_smooth += (nr_target - nr_smooth) * 0.15;
+            shared.nr_db_x10.store((nr_smooth * 10.0) as u32, Ordering::Relaxed);
+            let comp_target = if shared.auto_gain.load(Ordering::Relaxed) {
+                let before = peak(mono.iter().copied()) as f32 / 1000.0;
                 agc.process(&mut mono);
+                let after = peak(mono.iter().copied()) as f32 / 1000.0;
+                // Only the pulling-down is shown; lifting quiet speech reads as no reduction.
+                if before > 0.02 { (20.0 * (before / after.max(1e-6)).log10()).clamp(0.0, 30.0) } else { 0.0 }
             } else {
                 agc.gain = 1.0; // start fresh next time it's switched on
-            }
+                0.0
+            };
+            // Quick to rise, slow to fall, like a gain-reduction meter.
+            comp_smooth += (comp_target - comp_smooth) * if comp_target > comp_smooth { 0.5 } else { 0.06 };
+            shared.comp_db_x10.store((comp_smooth * 10.0) as u32, Ordering::Relaxed);
             let level = peak(mono.iter().copied());
             if level as f32 >= CLIP_LEVEL * 1000.0 {
                 shared.clips.fetch_add(1, Ordering::Relaxed);
