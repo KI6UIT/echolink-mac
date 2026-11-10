@@ -1,8 +1,8 @@
 # EchoLink for Mac
 
 A native-feeling **EchoLink** desktop app for macOS, written in Rust. It looks like a piece of
-bench gear instead of a web dashboard: a scan-lined readout, a tuning dial, swing-needle
-gauges and a big push-to-talk key that glows when you're on the air. Pick one of four themes with
+bench gear instead of a web dashboard: swing-needle gauges, a status tile that shows who you're
+linked to, and a big push-to-talk key that glows when you're on the air. Pick one of four themes with
 one click.
 
 ![Desktop app](docs/gui.png)
@@ -18,15 +18,17 @@ directory, shows who's on, and carries your voice both ways.
 - **Push-to-talk** by holding the big button, holding **Space**, or holding a **system-wide
   talk key** that works while EchoLink is in the background. A 3-minute transmit limit
   works like a repeater time-out timer, and the key warns you 30 seconds before it trips
-- **Readout panel** showing who you're linked to and how long they've been talking, with a
-  tuning scale whose marker is placed by node number
+- **Status tile** at the top: one wide button connects and disconnects (and names the station), and
+  the tile beside the node row shows talk/receive state on the left and the linked or selected
+  station on the right
 - **Swing-needle gauges** for RX, MIC, LINK, COMP and NR (see below). The mic gauge is live
   before you key up
 - **Logbook** with QRZ sync, upload, ADIF export, editing and callsign lookups (see below)
 - **Nets**: find EchoLink nets, see when they meet in your time zone, and join in one click (see below)
 - **Call control**: block list, allow-only list and Do Not Disturb
-- **Audio tools** (see below): mic gain, **AUTO-SET**, **Auto level**, **noise reduction**
-  and speaker volume
+- **Audio tools** (see below): mic gain, **AUTO-SET**, **Auto level**, **noise reduction**,
+  rumble filter, compressor, **VOX** voice-operated transmit, an adjustable jitter buffer and
+  speaker volume
 - **DTMF keypad** for repeater and conference control
 - **Choose your microphone and speaker** instead of the system default
 - **Text chat** and the far station's info text, with a station log underneath
@@ -232,7 +234,7 @@ the top of the script explain how.
   talk key from Settings.
 - Run **AUTO-SET** once, then say a few words on ECHOTEST to check your levels.
 - Click ☆ to make a station a favorite. **★ Favorites** shows only those.
-- Drag the **dividers** between the readout, the audio section and the logbook to give each the room
+- Drag the **dividers** between the controls, the audio section and the logbook/nets area to give each the room
   you want; they remember their place. The line between the station list and this column moves too.
 - **Settings** changes your details or connection. The app restarts itself to apply them.
 - Closing the window disconnects and logs you off the directory.
