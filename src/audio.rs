@@ -13,10 +13,13 @@ pub const RATE: u32 = 8000;
 /// The microphone chain (gain, noise reduction, auto level) runs at 48 kHz,
 /// which is what the RNNoise model expects; it's brought down to 8 kHz last.
 const WORK: u32 = 48000;
-/// Most audio queued for playback before old audio is dropped (0.6 s).
-const MAX_PLAYBACK: usize = RATE as usize * 6 / 10;
-/// Audio buffered before playback starts, to ride out network jitter (0.24 s).
-const PREBUFFER: usize = RATE as usize * 24 / 100;
+/// Audio held back before playback starts, to ride out network jitter, unless you set it
+/// otherwise (see `Shared::prebuffer_ms`).
+pub const DEFAULT_PREBUFFER_MS: u32 = 240;
+pub const MIN_PREBUFFER_MS: u32 = 100;
+pub const MAX_PREBUFFER_MS: u32 = 900;
+/// Beyond the prebuffer, how much more may queue up before old audio is dropped.
+const SLACK_MS: usize = 360;
 
 /// Low-pass FIR (windowed sinc) that keeps the 300-3400 Hz voice band.
 struct LowPass {
@@ -227,6 +230,88 @@ impl Denoiser {
     }
 }
 
+/// Second-order high-pass (Butterworth) that cuts rumble, plosives and handling noise below
+/// the voice band. The GSM codec spends its bits on the voice, so this also helps clarity.
+struct Highpass {
+    b: [f32; 3],
+    a: [f32; 2],
+    x: [f32; 2],
+    y: [f32; 2],
+}
+
+impl Highpass {
+    fn new(rate: u32, hz: f32) -> Highpass {
+        let w = 2.0 * std::f32::consts::PI * hz / rate as f32;
+        let (cos, alpha) = (w.cos(), w.sin() / (2.0 * std::f32::consts::FRAC_1_SQRT_2));
+        let a0 = 1.0 + alpha;
+        Highpass {
+            b: [(1.0 + cos) / 2.0 / a0, -(1.0 + cos) / a0, (1.0 + cos) / 2.0 / a0],
+            a: [-2.0 * cos / a0, (1.0 - alpha) / a0],
+            x: [0.0; 2],
+            y: [0.0; 2],
+        }
+    }
+
+    fn process(&mut self, buf: &mut [f32]) {
+        for s in buf {
+            let x = *s;
+            let y = self.b[0] * x + self.b[1] * self.x[0] + self.b[2] * self.x[1] - self.a[0] * self.y[0] - self.a[1] * self.y[1];
+            self.x = [x, self.x[0]];
+            self.y = [y, self.y[0]];
+            *s = y;
+        }
+    }
+}
+
+/// Where the voice high-pass cuts off.
+const HIGHPASS_HZ: f32 = 280.0;
+
+/// A speech compressor: turns loud syllables down and lifts quiet ones, so weak or mumbled
+/// speech stays readable. Quiet ones are only lifted above the noise floor.
+struct Compressor {
+    env_db: f32,
+    att: f32,
+    rel: f32,
+    threshold_db: f32,
+    ratio: f32,
+    makeup_db: f32,
+}
+
+impl Compressor {
+    fn new(rate: u32) -> Compressor {
+        let r = rate as f32;
+        Compressor { env_db: -90.0, att: (-1.0 / (0.005 * r)).exp(), rel: (-1.0 / (0.12 * r)).exp(), threshold_db: -24.0, ratio: 3.0, makeup_db: 8.4 }
+    }
+
+    /// 1 = light, 2 = medium, 3 = strong.
+    fn set_mode(&mut self, mode: u32) {
+        let (threshold_db, ratio) = match mode {
+            1 => (-20.0, 2.0),
+            2 => (-24.0, 3.0),
+            _ => (-28.0, 4.0),
+        };
+        self.threshold_db = threshold_db;
+        self.ratio = ratio;
+        // Make up most of what a typical loud peak (-6 dBFS) is turned down by.
+        self.makeup_db = 0.7 * (-6.0 - threshold_db) * (1.0 - 1.0 / ratio);
+    }
+
+    fn process(&mut self, buf: &mut [f32]) {
+        for s in buf {
+            let x = *s;
+            let level = 20.0 * x.abs().max(1e-5).log10();
+            let coef = if level > self.env_db { self.att } else { self.rel };
+            self.env_db = level + coef * (self.env_db - level);
+            let over = (self.env_db - self.threshold_db).max(0.0);
+            let reduction = over * (1.0 - 1.0 / self.ratio);
+            // The lift fades out toward the noise floor, so hiss between words isn't boosted.
+            let gate = ((self.env_db + 60.0) / 20.0).clamp(0.0, 1.0);
+            let gain_db = self.makeup_db * gate - reduction;
+            *s = soft_limit(x * db_to_lin(gain_db));
+        }
+    }
+}
+
 /// Slow automatic gain control with a soft limiter: lifts quiet talkers up to
 /// `TARGET_PEAK`, pulls loud ones down fast, holds still when nobody is talking
 /// (so it doesn't turn the room noise up), and never lets a peak past the red.
@@ -313,6 +398,21 @@ pub struct Shared {
     /// lost packets in tenths of a percent, jitter in tenths of a millisecond,
     /// milliseconds since anything came from them, and since a voice packet did
     /// (`u32::MAX` if none yet on this connection).
+    /// Speech processing on the way out.
+    pub hpf: AtomicBool,
+    /// 0 off, 1 light, 2 medium, 3 strong.
+    pub comp_mode: AtomicU32,
+    /// Voice-operated transmit: on, the level that keys it (thousandths of full scale),
+    /// and how long it stays on after you stop talking (ms).
+    pub vox: AtomicBool,
+    pub vox_x1000: AtomicU32,
+    pub vox_hang_ms: AtomicU32,
+    /// Audio held back before playback starts (ms); adjust for choppy connections.
+    pub prebuffer_ms: AtomicU32,
+    /// Let the app pick the buffer from how the connection is behaving.
+    pub buffer_auto: AtomicBool,
+    /// Times the audio ran dry in the middle of someone talking.
+    pub underruns: AtomicU32,
     pub link_loss_permille: AtomicU32,
     pub link_jitter_x10: AtomicU32,
     pub link_age_ms: AtomicU32,
@@ -321,6 +421,15 @@ pub struct Shared {
 }
 
 impl Shared {
+    pub fn prebuffer_samples(&self) -> usize {
+        self.prebuffer_ms.load(Ordering::Relaxed).clamp(MIN_PREBUFFER_MS, MAX_PREBUFFER_MS) as usize * RATE as usize / 1000
+    }
+
+    /// Audio waiting to be played, in ms: the delay you are adding to what you hear.
+    pub fn queued_ms(&self) -> u32 {
+        (self.playback.lock().unwrap().len() * 1000 / RATE as usize) as u32
+    }
+
     pub fn volume(&self) -> f32 {
         self.volume_x100.load(Ordering::Relaxed) as f32 / 100.0
     }
@@ -362,7 +471,8 @@ impl Shared {
     pub fn play(&self, pcm: &[i16]) {
         let mut q = self.playback.lock().unwrap();
         q.extend(pcm);
-        let excess = q.len().saturating_sub(MAX_PLAYBACK);
+        let cap = self.prebuffer_samples() + SLACK_MS * RATE as usize / 1000;
+        let excess = q.len().saturating_sub(cap);
         q.drain(..excess);
     }
 
@@ -458,6 +568,11 @@ pub fn open(
     let host = cpal::default_host();
     let shared = Arc::new(Shared::default());
     shared.volume_x100.store(100, Ordering::Relaxed);
+    shared.prebuffer_ms.store(DEFAULT_PREBUFFER_MS, Ordering::Relaxed);
+    shared.vox_x1000.store(80, Ordering::Relaxed);
+    shared.vox_hang_ms.store(700, Ordering::Relaxed);
+    shared.hpf.store(true, Ordering::Relaxed);
+    shared.buffer_auto.store(true, Ordering::Relaxed);
     shared.link_voice_age_ms.store(u32::MAX, Ordering::Relaxed);
     let mut notes = Vec::new();
 
@@ -488,6 +603,9 @@ pub fn open(
         let smooth = 1.0 / (0.01 * WORK as f32); // gain changes glide over ~10 ms
         let mut agc = Agc::new(WORK);
         let mut denoiser: Option<Denoiser> = None;
+        let mut hpf = Highpass::new(WORK, HIGHPASS_HZ);
+        let mut comp = Compressor::new(WORK);
+        let mut comp_mode_seen = 0u32;
         let (mut nr_smooth, mut comp_smooth) = (0.0f32, 0.0f32);
         let mut handle = move |data: &mut dyn Iterator<Item = f32>| {
             mono.clear();
@@ -516,7 +634,11 @@ pub fn open(
                 gain += (target - gain) * smooth;
                 *s *= gain;
             }
-            // Noise removal goes before auto level, so the AGC never boosts room noise.
+            // Cut rumble first: it would otherwise eat into the noise filter and the compressor.
+            if shared.hpf.load(Ordering::Relaxed) {
+                hpf.process(&mut mono);
+            }
+            // Noise removal goes before the compressor and auto level, so they never boost room noise.
             let rms = |v: &[f32]| (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
             let nr_target = if shared.denoise.load(Ordering::Relaxed) {
                 let before = rms(&mono);
@@ -530,14 +652,27 @@ pub fn open(
             };
             nr_smooth += (nr_target - nr_smooth) * 0.15;
             shared.nr_db_x10.store((nr_smooth * 10.0) as u32, Ordering::Relaxed);
-            let comp_target = if shared.auto_gain.load(Ordering::Relaxed) {
-                let before = peak(mono.iter().copied()) as f32 / 1000.0;
+            let (comp_on, agc_on) = (shared.comp_mode.load(Ordering::Relaxed), shared.auto_gain.load(Ordering::Relaxed));
+            let before = peak(mono.iter().copied()) as f32 / 1000.0;
+            if comp_on > 0 {
+                if comp_on != comp_mode_seen {
+                    comp.set_mode(comp_on);
+                    comp_mode_seen = comp_on;
+                }
+                comp.process(&mut mono);
+            } else {
+                comp_mode_seen = 0;
+            }
+            if agc_on {
                 agc.process(&mut mono);
+            } else {
+                agc.gain = 1.0; // start fresh next time it's switched on
+            }
+            let comp_target = if comp_on > 0 || agc_on {
                 let after = peak(mono.iter().copied()) as f32 / 1000.0;
                 // Only the pulling-down is shown; lifting quiet speech reads as no reduction.
                 if before > 0.02 { (20.0 * (before / after.max(1e-6)).log10()).clamp(0.0, 30.0) } else { 0.0 }
             } else {
-                agc.gain = 1.0; // start fresh next time it's switched on
                 0.0
             };
             // Quick to rise, slow to fall, like a gain-reduction meter.
@@ -550,7 +685,8 @@ pub fn open(
             shared.mic_level.store(level, Ordering::Relaxed);
             let tx = transmitting.load(Ordering::Relaxed) && !shared.mute_mic.load(Ordering::Relaxed);
             shared.tx_level.store(if tx { level } else { 0 }, Ordering::Relaxed);
-            if !tx {
+            // VOX needs to hear the microphone even when we aren't transmitting.
+            if !tx && !(shared.vox.load(Ordering::Relaxed) && !shared.mute_mic.load(Ordering::Relaxed)) {
                 return;
             }
             out.clear();
@@ -585,7 +721,7 @@ pub fn open(
                 src.clear();
                 {
                     let mut q = shared.playback.lock().unwrap();
-                    if !shared.playing.load(Ordering::Relaxed) && q.len() >= PREBUFFER {
+                    if !shared.playing.load(Ordering::Relaxed) && q.len() >= shared.prebuffer_samples() {
                         shared.playing.store(true, Ordering::Relaxed);
                     }
                     if shared.playing.load(Ordering::Relaxed) {
@@ -755,5 +891,55 @@ mod tests {
         let mut noise = sine(0.002, 80000); // room noise, below the gate
         agc.process(&mut noise);
         assert!((agc.gain - 1.0).abs() < 1e-3, "{}", agc.gain);
+    }
+
+    /// Peak of the last half of a buffer, once the filters have settled.
+    fn settled_peak(v: &[f32]) -> f32 {
+        v[v.len() / 2..].iter().fold(0.0f32, |m, x| m.max(x.abs()))
+    }
+
+    fn tone(hz: f32, amp: f32, n: usize) -> Vec<f32> {
+        (0..n).map(|i| amp * (2.0 * std::f32::consts::PI * hz * i as f32 / WORK as f32).sin()).collect()
+    }
+
+    #[test]
+    fn highpass_cuts_rumble_and_keeps_the_voice() {
+        let mut low = tone(60.0, 0.5, 48000);
+        Highpass::new(WORK, HIGHPASS_HZ).process(&mut low);
+        assert!(settled_peak(&low) < 0.5 * 0.1, "60 Hz should lose at least 20 dB, got {}", settled_peak(&low));
+        let mut voice = tone(1000.0, 0.5, 48000);
+        Highpass::new(WORK, HIGHPASS_HZ).process(&mut voice);
+        assert!((settled_peak(&voice) - 0.5).abs() < 0.02, "1 kHz passes untouched, got {}", settled_peak(&voice));
+    }
+
+    #[test]
+    fn compressor_turns_loud_down_lifts_quiet_and_leaves_hiss_alone() {
+        let mut c = Compressor::new(WORK);
+        c.set_mode(2); // threshold -24 dB, 3:1, makeup 8.4 dB
+        let mut loud = tone(1000.0, 0.5, 48000); // -6 dBFS
+        c.process(&mut loud);
+        let net_db = 20.0 * (settled_peak(&loud) / 0.5).log10();
+        assert!((net_db - (-3.6)).abs() < 1.5, "12 dB of squeeze less 8.4 dB of makeup is about -3.6 dB, got {net_db}");
+
+        let mut c = Compressor::new(WORK);
+        c.set_mode(2);
+        let mut quiet = tone(1000.0, 0.01, 48000); // -40 dBFS: below the threshold, above the floor
+        c.process(&mut quiet);
+        assert!(settled_peak(&quiet) > 0.01 * 2.0, "a weak voice is lifted, got {}", settled_peak(&quiet));
+
+        let mut c = Compressor::new(WORK);
+        c.set_mode(2);
+        let mut hiss = tone(1000.0, 0.0003, 48000); // -70 dBFS: the noise floor
+        c.process(&mut hiss);
+        assert!(settled_peak(&hiss) < 0.0003 * 1.3, "the floor is not boosted, got {}", settled_peak(&hiss));
+    }
+
+    #[test]
+    fn compressor_never_passes_the_limit() {
+        let mut c = Compressor::new(WORK);
+        c.set_mode(3);
+        let mut hot = tone(500.0, 1.0, 9600);
+        c.process(&mut hot);
+        assert!(hot.iter().all(|x| x.abs() <= LIMIT + 1e-4));
     }
 }

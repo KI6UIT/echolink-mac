@@ -16,4 +16,5 @@ pub mod proxy;
 pub mod qrz;
 pub mod qso;
 pub mod rtp;
+pub mod vox;
 pub mod session;

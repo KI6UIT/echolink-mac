@@ -326,6 +326,17 @@ impl Session {
         audio.shared.set_gain_db(cfg.mic_gain_db);
         audio.shared.auto_gain.store(cfg.auto_gain, std::sync::atomic::Ordering::Relaxed);
         audio.shared.denoise.store(cfg.noise_reduction, std::sync::atomic::Ordering::Relaxed);
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let sh = &audio.shared;
+            sh.vox.store(cfg.vox, Relaxed);
+            sh.vox_x1000.store((cfg.vox_level.clamp(0.0, 1.0) * 1000.0) as u32, Relaxed);
+            sh.vox_hang_ms.store(cfg.vox_hang_ms.clamp(100, 5000), Relaxed);
+            sh.hpf.store(cfg.tx_highpass, Relaxed);
+            sh.comp_mode.store(u32::from(cfg.tx_compressor.min(3)), Relaxed);
+            sh.prebuffer_ms.store(cfg.jitter_buffer_ms.clamp(audio::MIN_PREBUFFER_MS, audio::MAX_PREBUFFER_MS), Relaxed);
+            sh.buffer_auto.store(cfg.jitter_auto, Relaxed);
+        }
         let rules = Arc::new(RwLock::new(Rules::from_config(&cfg)));
         let me = qso::Station {
             callsign: cfg.callsign.clone(),

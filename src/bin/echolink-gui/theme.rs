@@ -412,6 +412,8 @@ pub struct Gauge<'a> {
     pub scale: Scale,
     /// The feature behind it is switched on; otherwise the needle rests and the face dims.
     pub active: bool,
+    /// A mark on the scale, such as the level that keys VOX (0 to 1).
+    pub marker: Option<f32>,
 }
 
 /// A small panel of figures that sits among the gauges.
@@ -585,6 +587,11 @@ pub fn vu_gauge(ui: &mut egui::Ui, g: &Gauge, size: Vec2) -> egui::Response {
         let v = i as f32 / 20.0;
         let len = (if i % 5 == 0 { 8.0 } else { 4.0 }) * k;
         p.line_segment([at(v, r - 3.0 * k), at(v, r - 3.0 * k - len)], Stroke::new(1.0, muted().gamma_multiply(dim)));
+    }
+    // A threshold, like the level that keys VOX.
+    if let Some(m) = g.marker.filter(|_| g.active) {
+        let (a, b, c) = (at(m, r + 1.0 * k), at(m - 0.025, r + 8.0 * k), at(m + 0.025, r + 8.0 * k));
+        p.add(egui::Shape::convex_polygon(vec![a, b, c], accent(), Stroke::NONE));
     }
     for &(v, text) in marks {
         p.text(at(v, r - 19.0 * k), egui::Align2::CENTER_CENTER, text, FontId::new(8.5 * k, FontFamily::Monospace), muted().gamma_multiply(dim));

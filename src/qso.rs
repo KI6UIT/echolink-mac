@@ -162,6 +162,11 @@ pub fn spawn(
         link: Default::default(),
         clock: Instant::now(),
         last_voice_pkt: None,
+        vox: Default::default(),
+        preroll: Default::default(),
+        rx_quiet_until: None,
+        underruns_seen: 0,
+        next_buffer_check: Instant::now(),
         tx_started: None,
         tx_buf: Vec::new(),
         seq: 0,
@@ -192,6 +197,14 @@ struct Engine {
     link: crate::link::LinkStats,
     clock: Instant,
     last_voice_pkt: Option<Instant>,
+    /// Voice-operated transmit, with the last bit of audio kept so the first word isn't lost.
+    vox: crate::vox::Vox,
+    preroll: std::collections::VecDeque<i16>,
+    /// The speaker can still be ringing; don't let VOX key before this.
+    rx_quiet_until: Option<Instant>,
+    /// Audio-gap bookkeeping for the automatic buffer.
+    underruns_seen: u32,
+    next_buffer_check: Instant,
     tx_started: Option<Instant>,
     tx_buf: Vec<i16>,
     seq: u16,
@@ -348,6 +361,7 @@ impl Engine {
 
     fn end_rx(&mut self) {
         if self.last_voice.take().is_some() {
+            self.rx_quiet_until = Some(Instant::now() + Duration::from_millis(500));
             self.emit(Event::Receiving(false));
         }
         self.shared.flush();
@@ -401,6 +415,8 @@ impl Engine {
         self.last_heard = Instant::now();
         self.link.reset();
         self.last_voice_pkt = None;
+        self.shared.underruns.store(0, Ordering::Relaxed);
+        self.underruns_seen = 0;
         self.publish_link();
         self.set_state(State::Connected { ip, callsign: callsign.clone(), name });
         self.send_ctrl(ip, &self.sdes);
@@ -433,6 +449,10 @@ impl Engine {
                     }
                 }
                 self.rx_packets.set(self.rx_packets.get() + 1);
+                // The speaker ran dry in the middle of an over: the next packet came too late.
+                if self.last_voice.is_some() && self.shared.queued_ms() == 0 {
+                    self.shared.underruns.fetch_add(1, Ordering::Relaxed);
+                }
                 self.shared.play(&pcm);
                 if self.last_voice.replace(Instant::now()).is_none() {
                     self.emit(Event::Receiving(true));
@@ -445,6 +465,39 @@ impl Engine {
     }
 
     fn mic(&mut self, pcm: &[i16]) {
+        if self.shared.vox.load(Ordering::Relaxed) {
+            let level = pcm.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0) as f32 / 32768.0;
+            let transmitting = self.transmitting.load(Ordering::Relaxed);
+            if !transmitting {
+                // Keep the last 200 ms, to send first when the key goes down.
+                self.preroll.extend(pcm.iter().copied());
+                let excess = self.preroll.len().saturating_sub(crate::audio::RATE as usize / 5);
+                self.preroll.drain(..excess);
+            }
+            let now = Instant::now();
+            let can_key = matches!(self.state, State::Connected { .. })
+                && self.last_voice.is_none()
+                && self.rx_quiet_until.is_none_or(|t| now >= t)
+                && !self.shared.mute_mic.load(Ordering::Relaxed);
+            let threshold = self.shared.vox_x1000.load(Ordering::Relaxed) as f32 / 1000.0;
+            let hang = u64::from(self.shared.vox_hang_ms.load(Ordering::Relaxed));
+            match self.vox.update(level, threshold, hang, self.clock.elapsed().as_millis() as u64, can_key, transmitting) {
+                crate::vox::Action::Key => {
+                    self.ptt(true);
+                    let lead: Vec<i16> = self.preroll.drain(..).collect();
+                    self.tx_buf.extend(lead);
+                    while self.tx_buf.len() >= PACKET_SAMPLES {
+                        self.flush_tx();
+                    }
+                    return;
+                }
+                crate::vox::Action::Unkey => {
+                    self.ptt(false);
+                    return;
+                }
+                crate::vox::Action::None => {}
+            }
+        }
         if !self.transmitting.load(Ordering::Relaxed) {
             return;
         }
@@ -467,6 +520,25 @@ impl Engine {
         self.seq = self.seq.wrapping_add(1);
     }
 
+    /// With the buffer on Auto: size it to the connection, a little at a time, and only
+    /// between overs so what you're hearing doesn't change under you.
+    fn tune_buffer(&mut self, now: Instant) {
+        if now < self.next_buffer_check {
+            return;
+        }
+        self.next_buffer_check = now + Duration::from_secs(2);
+        if !self.shared.buffer_auto.load(Ordering::Relaxed) || self.last_voice.is_some() || !self.link.has_data() {
+            return;
+        }
+        let gaps = self.shared.underruns.load(Ordering::Relaxed);
+        let want = crate::link::auto_buffer_ms(self.link.jitter_ms(), gaps.saturating_sub(self.underruns_seen));
+        self.underruns_seen = gaps;
+        let cur = self.shared.prebuffer_ms.load(Ordering::Relaxed);
+        // Grow quickly when it's rough, shrink slowly when it's calm.
+        let next = if want > cur { want.min(cur + 120) } else { want.max(cur.saturating_sub(40)) };
+        self.shared.prebuffer_ms.store(next.clamp(crate::audio::MIN_PREBUFFER_MS, crate::audio::MAX_PREBUFFER_MS), Ordering::Relaxed);
+    }
+
     /// Hand the link figures to the screen.
     fn publish_link(&self) {
         let sh = &self.shared;
@@ -487,12 +559,15 @@ impl Engine {
         self.publish_ages();
         if self.last_voice.is_some_and(|t| now - t > RX_HOLD) {
             self.last_voice = None;
+            self.rx_quiet_until = Some(now + Duration::from_millis(500));
             self.emit(Event::Receiving(false));
         }
         if self.tx_started.is_some_and(|t| now - t > TX_LIMIT) {
             self.emit(Event::Log("Transmit time limit (3 min) reached; unkeyed.".into()));
+            self.vox.timed_out();
             self.ptt(false);
         }
+        self.tune_buffer(now);
         match self.state.clone() {
             State::Idle => {}
             State::Connecting { ip, label } => {

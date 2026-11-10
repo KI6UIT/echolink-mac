@@ -982,7 +982,20 @@ impl Gui {
         s.cfg.auto_gain = s.audio.shared.auto_gain.load(Ordering::Relaxed);
         s.cfg.noise_reduction = s.audio.shared.denoise.load(Ordering::Relaxed);
         s.cfg.speaker_volume = s.audio.shared.volume();
+        {
+            let sh = &s.audio.shared;
+            s.cfg.vox = sh.vox.load(Ordering::Relaxed);
+            s.cfg.vox_level = sh.vox_x1000.load(Ordering::Relaxed) as f32 / 1000.0;
+            s.cfg.vox_hang_ms = sh.vox_hang_ms.load(Ordering::Relaxed);
+            s.cfg.tx_highpass = sh.hpf.load(Ordering::Relaxed);
+            s.cfg.tx_compressor = sh.comp_mode.load(Ordering::Relaxed) as u8;
+            s.cfg.jitter_buffer_ms = sh.prebuffer_ms.load(Ordering::Relaxed);
+            s.cfg.jitter_auto = sh.buffer_auto.load(Ordering::Relaxed);
+        }
         if let Ok(mut on_disk) = config::load() {
+            let c = s.cfg.clone();
+            (on_disk.vox, on_disk.vox_level, on_disk.vox_hang_ms, on_disk.tx_highpass) = (c.vox, c.vox_level, c.vox_hang_ms, c.tx_highpass);
+            (on_disk.tx_compressor, on_disk.jitter_buffer_ms, on_disk.jitter_auto) = (c.tx_compressor, c.jitter_buffer_ms, c.jitter_auto);
             on_disk.mic_gain_db = s.cfg.mic_gain_db;
             on_disk.auto_gain = s.cfg.auto_gain;
             on_disk.noise_reduction = s.cfg.noise_reduction;
@@ -1020,8 +1033,8 @@ impl Gui {
                 title_color: grade_color(quality),
                 lines: vec![
                     (if shared.link_voice_age_ms.load(Ordering::Relaxed) == u32::MAX { "Loss -   Jitter -".to_string() } else { format!("Loss {loss:.1}%  Jitter {jitter:.0} ms") }, theme::text()),
-                    (format!("Heard {heard}"), theme::muted()),
-                    (route.to_string(), theme::muted()),
+                    (format!("Buf {} ms · {} gaps", shared.prebuffer_ms.load(Ordering::Relaxed), shared.underruns.load(Ordering::Relaxed)), theme::muted()),
+                    (format!("Heard {heard} · {route}"), theme::muted()),
                 ],
             }
         } else {
@@ -1032,11 +1045,11 @@ impl Gui {
             }
         };
         let mut by_id: Vec<Option<theme::Cell>> = vec![
-            Some(theme::Cell::Gauge(theme::Gauge { label: "RX", value: rx, scale: theme::Scale::Level, active: true })),
-            Some(theme::Cell::Gauge(theme::Gauge { label: "MIC", value: mic, scale: theme::Scale::Level, active: true })),
-            Some(theme::Cell::Gauge(theme::Gauge { label: "LINK", value: quality, scale: theme::Scale::Quality, active: linked })),
-            Some(theme::Cell::Gauge(theme::Gauge { label: "COMP", value: comp, scale: theme::Scale::Reduction, active: shared.auto_gain.load(Ordering::Relaxed) })),
-            Some(theme::Cell::Gauge(theme::Gauge { label: "NR", value: nr, scale: theme::Scale::Noise, active: shared.denoise.load(Ordering::Relaxed) })),
+            Some(theme::Cell::Gauge(theme::Gauge { label: "RX", value: rx, scale: theme::Scale::Level, active: true, marker: None })),
+            Some(theme::Cell::Gauge(theme::Gauge { label: "MIC", value: mic, scale: theme::Scale::Level, active: true, marker: shared.vox.load(Ordering::Relaxed).then(|| shared.vox_x1000.load(Ordering::Relaxed) as f32 / 1000.0) })),
+            Some(theme::Cell::Gauge(theme::Gauge { label: "LINK", value: quality, scale: theme::Scale::Quality, active: linked, marker: None })),
+            Some(theme::Cell::Gauge(theme::Gauge { label: "COMP", value: comp, scale: theme::Scale::Reduction, active: shared.auto_gain.load(Ordering::Relaxed) || shared.comp_mode.load(Ordering::Relaxed) > 0, marker: None })),
+            Some(theme::Cell::Gauge(theme::Gauge { label: "NR", value: nr, scale: theme::Scale::Noise, active: shared.denoise.load(Ordering::Relaxed), marker: None })),
             Some(theme::Cell::Card(card)),
         ];
         let cells: Vec<theme::Cell> = self.gauge_order.iter().filter_map(|&id| by_id.get_mut(id).and_then(Option::take)).collect();
@@ -1136,6 +1149,74 @@ impl Gui {
                         .on_hover_text("Lights when the mic signal hits full scale. Turn the gain down.");
                 }
             }
+        });
+        // Speech processing, VOX and the playback buffer.
+        ui.horizontal_wrapped(|ui| {
+            ui.add_sized([26.0, 18.0], egui::Label::new(theme::silk("VOICE")));
+            let mut hp = shared.hpf.load(Ordering::Relaxed);
+            if ui.checkbox(&mut hp, "Cut rumble").on_hover_text("A high-pass filter at 280 Hz: removes desk thumps, wind and hum below the voice").changed() {
+                shared.hpf.store(hp, Ordering::Relaxed);
+                save = true;
+            }
+            ui.label("Compressor");
+            let names = ["Off", "Light", "Medium", "Strong"];
+            let mut mode = shared.comp_mode.load(Ordering::Relaxed).min(3);
+            egui::ComboBox::from_id_salt("comp-mode").selected_text(names[mode as usize]).width(78.0).show_ui(ui, |ui| {
+                for (i, name) in names.iter().enumerate() {
+                    if ui.selectable_value(&mut mode, i as u32, *name).changed() {
+                        shared.comp_mode.store(mode, Ordering::Relaxed);
+                        save = true;
+                    }
+                }
+            });
+            ui.label(RichText::new("lifts weak speech, tames loud").small().color(theme::muted()));
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.add_sized([26.0, 18.0], egui::Label::new(theme::silk("VOX")));
+            let mut vox = shared.vox.load(Ordering::Relaxed);
+            if ui
+                .checkbox(&mut vox, "Voice-operated transmit")
+                .on_hover_text("Keys the transmitter when you talk and releases it after a pause. It won't key while you're hearing someone.")
+                .changed()
+            {
+                shared.vox.store(vox, Ordering::Relaxed);
+                save = true;
+            }
+            if vox {
+                ui.label("Level");
+                let mut pct = shared.vox_x1000.load(Ordering::Relaxed) as f32 / 10.0;
+                let r = ui.add(egui::Slider::new(&mut pct, 1.0..=50.0).suffix("%").fixed_decimals(0)).on_hover_text("Shown as a mark on the MIC gauge. Set it just above your room noise.");
+                if r.changed() {
+                    shared.vox_x1000.store((pct * 10.0) as u32, Ordering::Relaxed);
+                }
+                save |= r.drag_stopped() || (r.changed() && !r.dragged());
+                ui.label("Hang");
+                let mut secs = shared.vox_hang_ms.load(Ordering::Relaxed) as f32 / 1000.0;
+                let r = ui.add(egui::DragValue::new(&mut secs).range(0.2..=3.0).speed(0.05).suffix(" s").fixed_decimals(1)).on_hover_text("How long it stays on after you stop talking");
+                if r.changed() {
+                    shared.vox_hang_ms.store((secs * 1000.0) as u32, Ordering::Relaxed);
+                }
+                save |= r.drag_stopped() || (r.changed() && !r.dragged());
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.add_sized([26.0, 18.0], egui::Label::new(theme::silk("BUF")));
+            let mut auto = shared.buffer_auto.load(Ordering::Relaxed);
+            if ui.checkbox(&mut auto, "Auto").on_hover_text("Sizes the playback buffer to your connection: bigger when it's jumpy, smaller when it's steady").changed() {
+                shared.buffer_auto.store(auto, Ordering::Relaxed);
+                save = true;
+            }
+            let mut ms = shared.prebuffer_ms.load(Ordering::Relaxed) as f32;
+            let r = ui
+                .add_enabled(!auto, egui::Slider::new(&mut ms, echolink::audio::MIN_PREBUFFER_MS as f32..=echolink::audio::MAX_PREBUFFER_MS as f32).suffix(" ms").step_by(20.0).fixed_decimals(0))
+                .on_hover_text("Audio held back before it plays. Bigger rides out Starlink or hotspot dropouts, at the cost of delay.");
+            if r.changed() {
+                shared.prebuffer_ms.store(ms as u32, Ordering::Relaxed);
+            }
+            save |= r.drag_stopped() || (r.changed() && !r.dragged());
+            let gaps = shared.underruns.load(Ordering::Relaxed);
+            ui.label(RichText::new(format!("{gaps} gap{}", if gaps == 1 { "" } else { "s" })).small().color(if gaps > 0 { theme::warn() } else { theme::muted() }))
+                .on_hover_text("Times the audio ran dry while someone was talking. If it keeps rising, raise the buffer.");
         });
         let note = if !self.mic_note.is_empty() {
             self.mic_note.as_str()

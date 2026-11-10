@@ -96,8 +96,8 @@ figures. Drag a gauge onto another to rearrange them (right-click to reset); the
   when the signal hits full scale.
 - **LINK** is the health of the connection, from the other station's voice packets: lost packets
   (from gaps in their sequence numbers), jitter, and how recently you heard from them. Needle right
-  is better. The card beside it shows the loss, jitter, time since the last packet and whether you
-  are direct or on a proxy. EchoLink has no ping, so round-trip delay isn't shown.
+  is better. The card beside it shows the loss, jitter, buffer and audio gaps, time since the last
+  packet and whether you are direct or on a proxy. EchoLink has no ping, so round-trip delay isn't shown.
 - **COMP** shows how many dB **Auto level** is pulling loud peaks down. **NR** shows how many dB
   of noise the noise reduction is removing. Each dims and reads OFF when its feature is off.
 - **GAIN** slider: -20 to +40 dB of software mic gain. macOS doesn't let apps set the input
@@ -112,6 +112,21 @@ figures. Drag a gauge onto another to rearrange them (right-click to reset); the
   [`nnnoiseless`](https://github.com/jneem/nnnoiseless) crate. It runs on your Mac and adds
   about 10 ms. It runs before Auto level, so noise is never amplified.
 - **VOL**: speaker volume, 0 to 200%.
+- **VOICE**: **Cut rumble** is a high-pass filter at 280 Hz that removes desk thumps, wind and hum
+  below the voice (on by default). **Compressor** (Off, Light, Medium, Strong) turns loud syllables
+  down and lifts weak ones so quiet speech stays readable; the lift fades out toward the noise floor so
+  hiss isn't boosted. The order is: gain, rumble filter, noise reduction, compressor, Auto level.
+  The COMP gauge shows the combined reduction.
+- **VOX**: voice-operated transmit instead of holding the key. It keys when your voice passes the
+  **Level** (shown as a mark on the MIC gauge: set it just above your room noise), keeps the last
+  200 ms so your first word isn't clipped, and releases after the **Hang** time. It never keys while
+  you are hearing someone or for half a second after, and after the 3-minute limit cuts in it waits for a
+  real pause before keying again. Holding the key still works as normal.
+- **BUF**: the playback buffer, in ms. **Auto** sizes it to the connection (bigger when audio arrives
+  unevenly or has run dry, smaller when steady); turn it off to set it yourself. A bigger buffer rides
+  out Starlink and hotspot dropouts at the cost of delay. The **gaps** count shows how often the
+  audio ran dry while someone was talking: if it keeps rising, raise the buffer. The buffer is the
+  delay you add; EchoLink has no ping, so the network's own round-trip time can't be measured.
 
 Everything is saved between launches. The processing order is: mic → gain → noise reduction →
 Auto level → 8 kHz → GSM.

@@ -76,6 +76,14 @@ pub fn quality(age_secs: f32, loss_pct: f32, jitter_ms: f32, recent_voice: bool)
     ((1.0 - penalty).clamp(0.0, 1.0)) * fresh
 }
 
+/// How much audio to hold back before playing, for the connection you have. Jumpy arrival
+/// (jitter) and audio that ran dry (underruns) both call for a bigger cushion; a steady
+/// connection can run with a small one and so a short delay.
+pub fn auto_buffer_ms(jitter_ms: f32, recent_underruns: u32) -> u32 {
+    let ms = 120.0 + 3.0 * jitter_ms + 60.0 * recent_underruns as f32;
+    ((ms.clamp(120.0, 700.0) / 20.0).round() as u32) * 20
+}
+
 pub fn grade(q: f32) -> &'static str {
     if q >= 0.8 {
         "GOOD"
@@ -153,6 +161,15 @@ mod tests {
             s.packet(i, i as u64 * 80);
         }
         assert!(s.loss_pct() < 5.0, "old loss should have faded, got {}", s.loss_pct());
+    }
+
+    #[test]
+    fn the_buffer_grows_with_trouble_and_stays_in_bounds() {
+        assert_eq!(auto_buffer_ms(0.0, 0), 120, "a clean link gets the shortest delay");
+        assert_eq!(auto_buffer_ms(40.0, 0), 240);
+        assert!(auto_buffer_ms(40.0, 3) > auto_buffer_ms(40.0, 0), "gaps in the audio mean more cushion");
+        assert_eq!(auto_buffer_ms(5000.0, 50), 700, "never more than 0.7 s");
+        assert_eq!(auto_buffer_ms(37.0, 0) % 20, 0);
     }
 
     #[test]

@@ -49,6 +49,25 @@ pub struct Config {
     /// Hold this key combination to talk, from any app (macOS), e.g. "ctrl+alt+space".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ptt_hotkey: Option<String>,
+    /// Voice-operated transmit instead of holding the key.
+    #[serde(default)]
+    pub vox: bool,
+    /// The level (0 to 1 of full scale) that starts VOX, and how long it stays on after you stop (ms).
+    #[serde(default = "default_vox_level")]
+    pub vox_level: f32,
+    #[serde(default = "default_vox_hang")]
+    pub vox_hang_ms: u32,
+    /// Speech processing on the way out: cut rumble below 280 Hz, and a compressor
+    /// (0 off, 1 light, 2 medium, 3 strong).
+    #[serde(default = "yes")]
+    pub tx_highpass: bool,
+    #[serde(default)]
+    pub tx_compressor: u8,
+    /// Audio held back before playback (ms), and whether the app sets it from the connection.
+    #[serde(default = "default_buffer")]
+    pub jitter_buffer_ms: u32,
+    #[serde(default = "yes")]
+    pub jitter_auto: bool,
     /// Your QRZ logbook access key (from the QRZ website, under your logbook's settings).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qrz_key: Option<String>,
@@ -140,6 +159,18 @@ pub fn update(f: impl FnOnce(&mut Config)) -> Result<()> {
     save(&c)
 }
 
+fn default_vox_level() -> f32 {
+    0.08
+}
+
+fn default_vox_hang() -> u32 {
+    700
+}
+
+fn default_buffer() -> u32 {
+    240
+}
+
 fn default_band() -> String {
     "2m".into()
 }
@@ -173,6 +204,13 @@ impl Config {
             qrz_on_exit: false,
             qrz_user: None,
             qrz_pass: None,
+            vox: false,
+            vox_level: default_vox_level(),
+            vox_hang_ms: default_vox_hang(),
+            tx_highpass: true,
+            tx_compressor: 0,
+            jitter_buffer_ms: default_buffer(),
+            jitter_auto: true,
             log_band: default_band(),
             log_mode: default_mode(),
             blocked: Vec::new(),
@@ -291,6 +329,13 @@ pub fn setup() -> Result<()> {
         qrz_key: old.as_ref().and_then(|c| c.qrz_key.clone()),
         qrz_auto: old.as_ref().map(|c| c.qrz_auto).unwrap_or(true),
         qrz_on_exit: old.as_ref().map(|c| c.qrz_on_exit).unwrap_or(false),
+        vox: old.as_ref().map(|c| c.vox).unwrap_or(false),
+        vox_level: old.as_ref().map(|c| c.vox_level).unwrap_or_else(default_vox_level),
+        vox_hang_ms: old.as_ref().map(|c| c.vox_hang_ms).unwrap_or_else(default_vox_hang),
+        tx_highpass: old.as_ref().map(|c| c.tx_highpass).unwrap_or(true),
+        tx_compressor: old.as_ref().map(|c| c.tx_compressor).unwrap_or(0),
+        jitter_buffer_ms: old.as_ref().map(|c| c.jitter_buffer_ms).unwrap_or_else(default_buffer),
+        jitter_auto: old.as_ref().map(|c| c.jitter_auto).unwrap_or(true),
         qrz_user: old.as_ref().and_then(|c| c.qrz_user.clone()),
         qrz_pass: old.as_ref().and_then(|c| c.qrz_pass.clone()),
         log_band: old.as_ref().map(|c| c.log_band.clone()).unwrap_or_else(default_band),
@@ -343,5 +388,6 @@ mod tests {
         let old = "callsign='K6ABC'\npassword='x'\nname='A'\nlocation='B'\n";
         let c: Config = toml::from_str(old).unwrap();
         assert!(c.qrz_key.is_none() && c.qrz_auto && !c.qrz_on_exit && c.log_band == "2m" && c.log_mode == "FM" && !c.dnd);
+        assert!(!c.vox && c.vox_level == 0.08 && c.vox_hang_ms == 700 && c.tx_highpass && c.tx_compressor == 0 && c.jitter_buffer_ms == 240 && c.jitter_auto);
     }
 }
