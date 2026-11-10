@@ -341,6 +341,11 @@ ELPROXY_CALL=N0CALL cargo test live -- --ignored   # tunnel to the directory thr
 `tests/run-peer-test.sh` runs a full call against a simulated station but needs Linux network
 namespaces, so it isn't available on macOS.
 
+## Roadmap
+
+What's planned next, including **radio link mode** (connecting a real radio to EchoLink, with rig control,
+PTT and squelch handling, and link / repeater nodes), is in [ROADMAP.md](ROADMAP.md).
+
 ## Linux
 
 It also builds on Linux (needs `gsm` and `alsa-lib`, e.g. `sudo pacman -S --needed gsm alsa-lib`).
