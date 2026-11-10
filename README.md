@@ -1,8 +1,8 @@
 # EchoLink for Mac
 
 A native-feeling **EchoLink** desktop app for macOS, written in Rust. It looks like a piece of
-bench gear instead of a web dashboard: a scan-lined readout, a tuning dial, LED level meters
-and a big push-to-talk key that glows when you're on the air. Pick one of four themes with
+bench gear instead of a web dashboard: a scan-lined readout, a tuning dial, swing-needle
+gauges and a big push-to-talk key that glows when you're on the air. Pick one of four themes with
 one click.
 
 ![Desktop app](docs/gui.png)
@@ -20,7 +20,10 @@ directory, shows who's on, and carries your voice both ways.
   works like a repeater time-out timer, and the key warns you 30 seconds before it trips
 - **Readout panel** showing who you're linked to and how long they've been talking, with a
   tuning scale whose marker is placed by node number
-- **Segmented RX and MIC LED meters**, with a clip lamp. The mic meter is live before you key up
+- **Swing-needle gauges** for RX, MIC, LINK, COMP and NR (see below). The mic gauge is live
+  before you key up
+- **Logbook** with QRZ sync, upload, ADIF export, editing and callsign lookups (see below)
+- **Call control**: block list, allow-only list and Do Not Disturb
 - **Audio tools** (see below): mic gain, **AUTO-SET**, **Auto level**, **noise reduction**
   and speaker volume
 - **DTMF keypad** for repeater and conference control
@@ -32,13 +35,53 @@ directory, shows who's on, and carries your voice both ways.
 - **Proxy support** for Starlink, cellular and other connections that can't forward ports
 - A **terminal client** (`echolink-tui`) built on the same engine, if you want it
 
+## Logbook
+
+Every connection you make or take is saved on your Mac. Open the **LOGBOOK** tab next to the
+station log.
+
+- **Your contacts** newest first, in UTC, with search by callsign or name. Connections of 10
+  seconds or more to anything other than a conference or the echo test count as contacts.
+- **Worked before**: the **Wkd** column in the station list shows how many times you've worked
+  a station, and the station log tells you when you connect ("You've worked K6ABC 3 times before").
+- **QRZ sync**: add your QRZ logbook key in **Settings** (QRZ logbook), then press **SYNC FROM
+  QRZ** to copy your whole QRZ logbook here. Later syncs fetch only what's new; **FULL RE-SYNC**
+  downloads everything again. Sync only reads from QRZ.
+- **QRZ upload**: contacts go up to QRZ as they end. A setting also sends anything unsent when you
+  quit. QRZ needs a band and mode for every contact, so Settings has defaults (2m, FM); contacts are
+  tagged `PROP_MODE=ECH` (EchoLink) so they don't count toward awards. Uploads need a QRZ subscription.
+- **ADIF export** saves an `.adi` file in Documents for any logging program.
+- **Add, edit, delete**: **+ ADD CONTACT** logs one by hand (untick *EchoLink contact* for an RF
+  contact). Click a row for **EDIT** and **DELETE**, or right-click it. Contacts that came from QRZ
+  are edited on QRZ, so the details QRZ holds (reports, notes, confirmations) aren't overwritten.
+  Deleting one from QRZ is permanent: QRZ has no undo.
+- **Callsign lookups**: add your **QRZ account** (username and password) in Settings, then click a
+  row or type a callsign in the search box. Their QRZ page opens in a pane beside the logbook: photo,
+  details, bio and your history with them. QRZ gives full details to XML subscribers only.
+
+Your key and login stay in your settings file (permissions 600) and go only to QRZ.
+
+## Call control
+
+- **DND** in the top bar refuses every incoming call.
+- In **Settings**, a **block list** and an **allow-only list** take calls (`K6ABC`) or prefixes (`W1*`).
+- **RECENT**, next to ECHOTEST, reconnects to someone you've talked to lately.
+- The Dock icon bounces when someone calls while the window is in the background.
+
 ## Audio tools
 
-Under the push-to-talk key:
+Under the push-to-talk key, the **AUDIO** section has five swing-needle gauges and a card of link
+figures. Drag a gauge onto another to rearrange them (right-click to reset); the order is saved.
 
-- **MIC meter**: shows your level all the time, so you can set it before going on the air.
-  Aim for speech peaks in the **yellow**; the **red** zone means clipping, and the `CLIP`
-  lamp lights when the signal hits full scale.
+- **RX** and **MIC** show your level all the time, so you can set it before going on the air.
+  Aim for speech peaks in the **yellow**; the **red** zone means clipping, and the lamp lights
+  when the signal hits full scale.
+- **LINK** is the health of the connection, from the other station's voice packets: lost packets
+  (from gaps in their sequence numbers), jitter, and how recently you heard from them. Needle right
+  is better. The card beside it shows the loss, jitter, time since the last packet and whether you
+  are direct or on a proxy. EchoLink has no ping, so round-trip delay isn't shown.
+- **COMP** shows how many dB **Auto level** is pulling loud peaks down. **NR** shows how many dB
+  of noise the noise reduction is removing. Each dims and reads OFF when its feature is off.
 - **GAIN** slider: -20 to +40 dB of software mic gain. macOS doesn't let apps set the input
   volume, so the gain is applied inside the app.
 - **AUTO-SET**: talk normally for 5 seconds and the gain is set so your loudest speech
@@ -150,6 +193,8 @@ the top of the script explain how.
   talk key from Settings.
 - Run **AUTO-SET** once, then say a few words on ECHOTEST to check your levels.
 - Click ☆ to make a station a favorite. **★ Favorites** shows only those.
+- Drag the **dividers** between the readout, the audio section and the logbook to give each the room
+  you want; they remember their place. The line between the station list and this column moves too.
 - **Settings** changes your details or connection. The app restarts itself to apply them.
 - Closing the window disconnects and logs you off the directory.
 
@@ -161,6 +206,9 @@ Try ECHOTEST (node 9999) first. It plays back what you say.
 |---|---|
 | Settings, including favorites, audio and devices | `~/Library/Application Support/echolink-tui/config.toml` (permissions 600) |
 | Theme | `~/Library/Application Support/echolink-tui/gui-theme` |
+| Divider positions and gauge order | `~/Library/Application Support/echolink-tui/gui-layout` |
+| Your contacts | `~/Library/Application Support/echolink-tui/contacts.jsonl` |
+| Copy of your QRZ logbook | `~/Library/Application Support/echolink-tui/qrz-logbook.jsonl` |
 | Activity log | `~/Library/Application Support/echolink-tui/activity.log` |
 
 Your password is stored in the settings file. You can also leave it out of the file and set
@@ -244,7 +292,8 @@ The desktop app is built with [egui](https://github.com/emilk/egui).
 
 ```bash
 cargo test    # packet formats, directory parsing, GSM codec, resampler, proxy framing,
-              # mic gain, auto-set, auto level, noise reduction and DTMF tones
+              # mic gain, auto-set, auto level, noise reduction, DTMF tones, the contact log,
+              # ADIF, QRZ upload/sync/lookup (against a stand-in server) and link measurement
 ELPROXY_CALL=N0CALL cargo test live -- --ignored   # tunnel to the directory through a real public proxy
 ```
 

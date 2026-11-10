@@ -1,6 +1,6 @@
 [package]
 name = "echolink-tui"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "EchoLink client for the Linux and macOS terminal"
 license = "GPL-2.0-or-later"
