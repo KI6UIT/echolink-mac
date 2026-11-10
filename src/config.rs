@@ -37,6 +37,18 @@ pub struct Config {
     /// Remove background (room) noise from your microphone.
     #[serde(default)]
     pub noise_reduction: bool,
+    /// Microphone to use, by name; leave out for the system default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_device: Option<String>,
+    /// Speaker to use, by name; leave out for the system default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_device: Option<String>,
+    /// Speaker volume, 1.0 = as received.
+    #[serde(default = "full_volume")]
+    pub speaker_volume: f32,
+    /// Hold this key combination to talk, from any app (macOS), e.g. "ctrl+alt+space".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ptt_hotkey: Option<String>,
 }
 
 impl Config {
@@ -55,6 +67,10 @@ impl Config {
             mic_gain_db: 0.0,
             auto_gain: false,
             noise_reduction: false,
+            input_device: None,
+            output_device: None,
+            speaker_volume: 1.0,
+            ptt_hotkey: None,
         }
     }
 }
@@ -73,6 +89,10 @@ fn default_servers() -> Vec<String> {
     ["servers.echolink.org", "naeast.echolink.org", "nasouth.echolink.org", "backup.echolink.org"]
         .map(String::from)
         .to_vec()
+}
+
+fn full_volume() -> f32 {
+    1.0
 }
 
 fn yes() -> bool {
@@ -156,6 +176,10 @@ pub fn setup() -> Result<()> {
         mic_gain_db: old.as_ref().map(|c| c.mic_gain_db).unwrap_or(0.0),
         auto_gain: old.as_ref().map(|c| c.auto_gain).unwrap_or(false),
         noise_reduction: old.as_ref().map(|c| c.noise_reduction).unwrap_or(false),
+        input_device: old.as_ref().and_then(|c| c.input_device.clone()),
+        output_device: old.as_ref().and_then(|c| c.output_device.clone()),
+        speaker_volume: old.as_ref().map(|c| c.speaker_volume).unwrap_or(1.0),
+        ptt_hotkey: old.as_ref().and_then(|c| c.ptt_hotkey.clone()),
     };
     save(&cfg)?;
     println!("\nSaved to {} (readable only by you).", path().display());

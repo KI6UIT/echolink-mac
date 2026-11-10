@@ -100,6 +100,7 @@ impl Resampler {
 pub const TARGET_PEAK: f32 = 0.70;
 /// Peaks at or above this count as clipping.
 pub const CLIP_LEVEL: f32 = 0.98;
+pub const MAX_VOLUME: f32 = 2.0;
 pub const GAIN_MIN_DB: f32 = -20.0;
 pub const GAIN_MAX_DB: f32 = 40.0;
 /// How long auto-set listens to you talk.
@@ -300,10 +301,22 @@ pub struct Shared {
     pub auto_gain: AtomicBool,
     /// Background (room) noise removal on.
     pub denoise: AtomicBool,
+    /// Speaker volume in percent (100 = as received).
+    pub volume_x100: AtomicU32,
+    /// Keep the microphone out of the transmission (while DTMF tones play).
+    pub mute_mic: AtomicBool,
     cal: Mutex<Calibrator>,
 }
 
 impl Shared {
+    pub fn volume(&self) -> f32 {
+        self.volume_x100.load(Ordering::Relaxed) as f32 / 100.0
+    }
+
+    pub fn set_volume(&self, v: f32) {
+        self.volume_x100.store((v.clamp(0.0, MAX_VOLUME) * 100.0).round() as u32, Ordering::Relaxed);
+    }
+
     pub fn gain_db(&self) -> f32 {
         self.gain_x10.load(Ordering::Relaxed) as f32 / 10.0
     }
@@ -377,22 +390,67 @@ fn pick(ranges: Vec<SupportedStreamConfigRange>) -> Result<(StreamConfig, Sample
     Ok((cfg.config(), cfg.sample_format()))
 }
 
+/// Names of the sound inputs and outputs on this computer.
+pub fn devices() -> (Vec<String>, Vec<String>) {
+    let host = cpal::default_host();
+    let names = |it: Result<Vec<cpal::Device>, _>| -> Vec<String> {
+        let mut v: Vec<String> = it.unwrap_or_default().iter().filter_map(|d| d.name().ok()).collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    (
+        names(host.input_devices().map(|d| d.collect::<Vec<_>>())),
+        names(host.output_devices().map(|d| d.collect::<Vec<_>>())),
+    )
+}
+
+/// The named device, or the system default when `name` is empty or gone.
+fn choose(
+    host: &cpal::Host,
+    name: Option<&str>,
+    input: bool,
+    notes: &mut Vec<String>,
+) -> Result<cpal::Device> {
+    if let Some(want) = name.map(str::trim).filter(|n| !n.is_empty()) {
+        let mut all = if input { host.input_devices()? } else { host.output_devices()? };
+        if let Some(d) = all.find(|d| d.name().is_ok_and(|n| n == want)) {
+            return Ok(d);
+        }
+        notes.push(format!("{} \"{want}\" isn't connected; using the default.", if input { "Microphone" } else { "Speaker" }));
+    }
+    if input {
+        host.default_input_device().context("no microphone found")
+    } else {
+        host.default_output_device().context("no speaker found")
+    }
+}
+
 pub struct Audio {
     _input: Stream,
     _output: Stream,
     pub shared: Arc<Shared>,
     pub description: String,
+    /// Things worth telling the user about how the devices were picked.
+    pub notes: Vec<String>,
 }
 
 /// Open the default microphone and speaker. Captured audio is delivered to
 /// `mic` in 8 kHz chunks while `transmitting` is set.
-pub fn open(mic: Sender<Vec<i16>>, transmitting: Arc<AtomicBool>) -> Result<Audio> {
+pub fn open(
+    mic: Sender<Vec<i16>>,
+    transmitting: Arc<AtomicBool>,
+    input_name: Option<&str>,
+    output_name: Option<&str>,
+) -> Result<Audio> {
     let host = cpal::default_host();
     let shared = Arc::new(Shared::default());
+    shared.volume_x100.store(100, Ordering::Relaxed);
+    let mut notes = Vec::new();
 
-    let indev = host.default_input_device().context("no microphone found")?;
+    let indev = choose(&host, input_name, true, &mut notes)?;
     let (incfg, infmt) = pick(indev.supported_input_configs()?.collect())?;
-    let outdev = host.default_output_device().context("no speaker found")?;
+    let outdev = choose(&host, output_name, false, &mut notes)?;
     let (outcfg, outfmt) = pick(outdev.supported_output_configs()?.collect())?;
 
     let description = format!(
@@ -460,7 +518,7 @@ pub fn open(mic: Sender<Vec<i16>>, transmitting: Arc<AtomicBool>) -> Result<Audi
                 shared.clips.fetch_add(1, Ordering::Relaxed);
             }
             shared.mic_level.store(level, Ordering::Relaxed);
-            let tx = transmitting.load(Ordering::Relaxed);
+            let tx = transmitting.load(Ordering::Relaxed) && !shared.mute_mic.load(Ordering::Relaxed);
             shared.tx_level.store(if tx { level } else { 0 }, Ordering::Relaxed);
             if !tx {
                 return;
@@ -513,7 +571,8 @@ pub fn open(mic: Sender<Vec<i16>>, transmitting: Arc<AtomicBool>) -> Result<Audi
                 rs.process(&src, &mut res);
                 pending.extend(res.iter());
             }
-            let block: Vec<f32> = pending.drain(..frames).collect();
+            let vol = shared.volume();
+            let block: Vec<f32> = pending.drain(..frames).map(|s| (s * vol).clamp(-1.0, 1.0)).collect();
             shared.rx_level.store(peak(block.iter().copied()), Ordering::Relaxed);
             block
         };
@@ -546,7 +605,7 @@ pub fn open(mic: Sender<Vec<i16>>, transmitting: Arc<AtomicBool>) -> Result<Audi
 
     input.play()?;
     output.play()?;
-    Ok(Audio { _input: input, _output: output, shared, description })
+    Ok(Audio { _input: input, _output: output, shared, description, notes })
 }
 
 #[cfg(test)]

@@ -3,6 +3,7 @@
 pub mod audio;
 pub mod config;
 pub mod directory;
+pub mod dtmf;
 pub mod gsm;
 pub mod log;
 pub mod net;

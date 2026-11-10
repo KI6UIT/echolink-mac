@@ -15,17 +15,58 @@ directory, shows who's on, and carries your voice both ways.
 
 - **Live station list** with search by callsign, place or node number, filters for
   Repeaters, Links, Conferences and Users, and favorites that sort to the top
-- **Push-to-talk** by holding the big button or holding **Space**. A 3-minute transmit limit
+- **Push-to-talk** by holding the big button, holding **Space**, or holding a **system-wide
+  talk key** that works while EchoLink is in the background. A 3-minute transmit limit
   works like a repeater time-out timer, and the key warns you 30 seconds before it trips
-- **Readout panel** showing who you're linked to, with a tuning scale whose marker is
-  placed by node number
-- **Segmented RX and TX LED meters**
+- **Readout panel** showing who you're linked to and how long they've been talking, with a
+  tuning scale whose marker is placed by node number
+- **Segmented RX and MIC LED meters**, with a clip lamp. The mic meter is live before you key up
+- **Audio tools** (see below): mic gain, **AUTO-SET**, **Auto level**, **noise reduction**
+  and speaker volume
+- **DTMF keypad** for repeater and conference control
+- **Choose your microphone and speaker** instead of the system default
 - **Text chat** and the far station's info text, with a station log underneath
 - **Notifications** for incoming calls and chat when the window isn't focused
 - **Accepts incoming connections** while you're idle (can be turned off in Settings)
 - **ECHOTEST** button for a quick audio check: it records you and plays it back
 - **Proxy support** for Starlink, cellular and other connections that can't forward ports
 - A **terminal client** (`echolink-tui`) built on the same engine, if you want it
+
+## Audio tools
+
+Under the push-to-talk key:
+
+- **MIC meter**: shows your level all the time, so you can set it before going on the air.
+  Aim for speech peaks in the **yellow**; the **red** zone means clipping, and the `CLIP`
+  lamp lights when the signal hits full scale.
+- **GAIN** slider: -20 to +40 dB of software mic gain. macOS doesn't let apps set the input
+  volume, so the gain is applied inside the app.
+- **AUTO-SET**: talk normally for 5 seconds and the gain is set so your loudest speech
+  peaks at about 70%, inside the yellow.
+- **Auto level**: keeps adjusting while you talk. It lifts quiet speech, pulls loud speech
+  down quickly, holds still when you're silent (so it doesn't boost room noise) and has a
+  soft limiter so a peak never reaches the red.
+- **Noise reduction**: removes background noise (fans, hum, keyboards) with
+  [RNNoise](https://gitlab.xiph.org/xiph/rnnoise), through the pure-Rust
+  [`nnnoiseless`](https://github.com/jneem/nnnoiseless) crate. It runs on your Mac and adds
+  about 10 ms. It runs before Auto level, so noise is never amplified.
+- **VOL**: speaker volume, 0 to 200%.
+
+Everything is saved between launches. The processing order is: mic → gain → noise reduction →
+Auto level → 8 kHz → GSM.
+
+### DTMF keypad
+
+Open **DTMF KEYPAD** under the audio controls and click keys (0-9, A-D, *, #) or type a string
+of digits and press **SEND**. The tones are sent in the voice stream, and the app keys up for
+you and keeps your microphone out of it while they play.
+
+### Talk key and devices
+
+In **Settings**, **Talk key** offers Ctrl+Option+Space, Ctrl+Option+T, F13, F14 or F15. Hold
+it to talk from any app. It uses macOS hotkeys, which need no Accessibility permission.
+**Microphone** and **Speaker** choose a specific sound device (for example a USB interface or
+headset). If a chosen device isn't connected, the app falls back to the system default.
 
 ## Themes
 
@@ -43,7 +84,7 @@ The choice is saved in `~/Library/Application Support/echolink-tui/gui-theme`.
 
 ## Requirements
 
-- A Mac with macOS and a microphone and speaker (the default CoreAudio devices are used)
+- A Mac with macOS and a microphone and speaker (the system default devices unless you pick others in Settings)
 - A callsign validated for EchoLink at <https://secure.echolink.org/validation/>.
   Use your personal callsign (e.g. `N0CALL`), not a `-R`/`-L` node callsign that a repeater
   or link is already logged in with.
@@ -53,6 +94,23 @@ The choice is saved in `~/Library/Application Support/echolink-tui/gui-theme`.
   forward ports, so they need the proxy.
 
 ## Install
+
+### Option 1: download the app (Apple Silicon)
+
+Download `EchoLink-<version>-arm64.dmg` from the
+[latest release](https://github.com/KI6UIT/echolink-mac/releases/latest), open it and drag
+**EchoLink** to **Applications**. Nothing else needs installing (libgsm is inside the app).
+
+The app is ad-hoc signed, not notarized, so macOS blocks it the first time. Right-click it and
+choose **Open**, then **Open** again, or go to **System Settings, Privacy & Security** and click
+**Open Anyway**. You only do this once. Check the download against `SHA256SUMS.txt` on the
+release page if you like:
+
+```bash
+shasum -a 256 ~/Downloads/EchoLink-*.dmg
+```
+
+### Option 2: build from source
 
 ```bash
 brew install rustup libgsm
@@ -78,10 +136,19 @@ xattr -dr com.apple.quarantine ~/Applications/EchoLink.app
 
 To update, pull and run `./install.sh` again. Quit the app first.
 
+### Building the DMG yourself
+
+`packaging/build-dmg.sh` builds a self-contained `EchoLink.app` for your Mac's architecture,
+copies libgsm into the bundle, signs it and writes `dist/EchoLink-<version>-<arch>.dmg`. Set
+`SIGN_IDENTITY` (and `NOTARY_PROFILE`) to sign with a Developer ID and notarize; the comments at
+the top of the script explain how.
+
 ## Using the app
 
 - Double-click a station, type a node number and press Enter, or press **ECHOTEST**.
-- Hold the **Push to talk** key, or hold **Space** while no text box is selected.
+- Hold the **Push to talk** key, or hold **Space** while no text box is selected, or hold your
+  talk key from Settings.
+- Run **AUTO-SET** once, then say a few words on ECHOTEST to check your levels.
 - Click ☆ to make a station a favorite. **★ Favorites** shows only those.
 - **Settings** changes your details or connection. The app restarts itself to apply them.
 - Closing the window disconnects and logs you off the directory.
@@ -92,7 +159,7 @@ Try ECHOTEST (node 9999) first. It plays back what you say.
 
 | What | Where |
 |---|---|
-| Settings, including favorites | `~/Library/Application Support/echolink-tui/config.toml` (permissions 600) |
+| Settings, including favorites, audio and devices | `~/Library/Application Support/echolink-tui/config.toml` (permissions 600) |
 | Theme | `~/Library/Application Support/echolink-tui/gui-theme` |
 | Activity log | `~/Library/Application Support/echolink-tui/activity.log` |
 
@@ -176,7 +243,8 @@ The desktop app is built with [egui](https://github.com/emilk/egui).
 ## Tests
 
 ```bash
-cargo test    # packet formats, directory parsing, GSM codec, resampler, proxy framing
+cargo test    # packet formats, directory parsing, GSM codec, resampler, proxy framing,
+              # mic gain, auto-set, auto level, noise reduction and DTMF tones
 ELPROXY_CALL=N0CALL cargo test live -- --ignored   # tunnel to the directory through a real public proxy
 ```
 

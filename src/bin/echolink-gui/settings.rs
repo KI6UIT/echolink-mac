@@ -10,7 +10,18 @@ enum ProxyMode {
     Custom,
 }
 
+/// Key combinations offered for the system-wide push-to-talk key (macOS).
+const HOTKEYS: [(&str, &str); 5] = [
+    ("Ctrl + Option + Space", "ctrl+alt+space"),
+    ("Ctrl + Option + T", "ctrl+alt+t"),
+    ("F13", "f13"),
+    ("F14", "f14"),
+    ("F15", "f15"),
+];
+
 pub struct Form {
+    inputs: Vec<String>,
+    outputs: Vec<String>,
     cfg: Config,
     /// Blank keeps the saved password.
     password: String,
@@ -36,7 +47,8 @@ impl Form {
             Some(p) if p.eq_ignore_ascii_case("auto") => (ProxyMode::Auto, String::new()),
             Some(p) => (ProxyMode::Custom, p.to_string()),
         };
-        Form { cfg, password: String::new(), proxy_mode, proxy_host, error: String::new(), first_run }
+        let (inputs, outputs) = echolink::audio::devices();
+        Form { inputs, outputs, cfg, password: String::new(), proxy_mode, proxy_host, error: String::new(), first_run }
     }
 
     pub fn show(&mut self, ctx: &egui::Context) -> Outcome {
@@ -90,6 +102,33 @@ impl Form {
                     ui.label("");
                     ui.checkbox(&mut self.cfg.accept_incoming, "Accept calls from other stations");
                     ui.end_row();
+
+                    ui.label("Microphone");
+                    device_picker(ui, "mic", &self.inputs, &mut self.cfg.input_device);
+                    ui.end_row();
+
+                    ui.label("Speaker");
+                    device_picker(ui, "speaker", &self.outputs, &mut self.cfg.output_device);
+                    ui.end_row();
+
+                    if cfg!(target_os = "macos") {
+                        ui.label("Talk key");
+                        ui.vertical(|ui| {
+                            let shown = HOTKEYS
+                                .iter()
+                                .find(|(_, v)| self.cfg.ptt_hotkey.as_deref() == Some(*v))
+                                .map(|(l, _)| *l)
+                                .unwrap_or("Off");
+                            egui::ComboBox::from_id_salt("hotkey").selected_text(shown).width(200.0).show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.cfg.ptt_hotkey, None, "Off");
+                                for (label, value) in HOTKEYS {
+                                    ui.selectable_value(&mut self.cfg.ptt_hotkey, Some(value.to_string()), label);
+                                }
+                            });
+                            ui.label(egui::RichText::new("Hold it to talk, even when EchoLink is in the background.").small().weak());
+                        });
+                        ui.end_row();
+                    }
                 });
 
                 if !self.error.is_empty() {
@@ -135,4 +174,20 @@ impl Form {
         };
         Ok(cfg)
     }
+}
+
+/// A drop-down of sound devices. "System default" stores nothing, so the app
+/// follows whatever macOS has selected.
+fn device_picker(ui: &mut egui::Ui, id: &str, devices: &[String], choice: &mut Option<String>) {
+    let shown = match choice {
+        None => "System default".to_string(),
+        Some(n) if devices.contains(n) => n.clone(),
+        Some(n) => format!("{n} (not connected)"),
+    };
+    egui::ComboBox::from_id_salt(id).selected_text(shown).width(260.0).show_ui(ui, |ui| {
+        ui.selectable_value(choice, None, "System default");
+        for d in devices {
+            ui.selectable_value(choice, Some(d.clone()), d);
+        }
+    });
 }

@@ -54,6 +54,12 @@ struct Gui {
     clip_until: Option<Instant>,
     /// Result of the last auto-set, shown under the mic controls.
     mic_note: String,
+    keypad_open: bool,
+    dtmf_input: String,
+    /// True while the system-wide talk key is held (macOS).
+    hotkey_down: Arc<AtomicBool>,
+    #[cfg(target_os = "macos")]
+    _hotkeys: Option<global_hotkey::GlobalHotKeyManager>,
 }
 
 impl Gui {
@@ -77,6 +83,11 @@ impl Gui {
             last_clips: 0,
             clip_until: None,
             mic_note: String::new(),
+            keypad_open: false,
+            dtmf_input: String::new(),
+            hotkey_down: Arc::new(AtomicBool::new(false)),
+            #[cfg(target_os = "macos")]
+            _hotkeys: None,
         };
         match config::load() {
             Ok(cfg) => {
@@ -84,11 +95,38 @@ impl Gui {
                     // Give the previous instance a moment to release its ports.
                     std::thread::sleep(Duration::from_millis(1500));
                 }
+                #[cfg(target_os = "macos")]
+                gui.register_hotkey(&cc.egui_ctx, cfg.ptt_hotkey.as_deref());
                 gui.start(cfg);
             }
             Err(_) => gui.settings = Some(settings::Form::new(None)),
         }
         gui
+    }
+
+    /// Hold-to-talk from any app. Uses Carbon hotkeys, which need no
+    /// Accessibility permission.
+    #[cfg(target_os = "macos")]
+    fn register_hotkey(&mut self, ctx: &egui::Context, spec: Option<&str>) {
+        use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState, hotkey::HotKey};
+        let Some(spec) = spec else { return };
+        let Ok(key) = spec.parse::<HotKey>() else {
+            echolink::log!("talk key {spec:?} isn't a key combination I know");
+            return;
+        };
+        let Ok(manager) = GlobalHotKeyManager::new() else { return };
+        if let Err(e) = manager.register(key) {
+            echolink::log!("couldn't register the talk key {spec}: {e}");
+            return;
+        }
+        let (down, ctx, id) = (self.hotkey_down.clone(), ctx.clone(), key.id());
+        GlobalHotKeyEvent::set_event_handler(Some(move |e: GlobalHotKeyEvent| {
+            if e.id == id {
+                down.store(e.state == HotKeyState::Pressed, Ordering::Relaxed);
+                ctx.request_repaint(); // wake the UI even if the window is hidden
+            }
+        }));
+        self._hotkeys = Some(manager);
     }
 
     fn start(&mut self, cfg: Config) {
@@ -129,10 +167,12 @@ impl Gui {
         s.cfg.mic_gain_db = s.audio.shared.gain_db();
         s.cfg.auto_gain = s.audio.shared.auto_gain.load(Ordering::Relaxed);
         s.cfg.noise_reduction = s.audio.shared.denoise.load(Ordering::Relaxed);
+        s.cfg.speaker_volume = s.audio.shared.volume();
         if let Ok(mut on_disk) = config::load() {
             on_disk.mic_gain_db = s.cfg.mic_gain_db;
             on_disk.auto_gain = s.cfg.auto_gain;
             on_disk.noise_reduction = s.cfg.noise_reduction;
+            on_disk.speaker_volume = s.cfg.speaker_volume;
             if let Err(e) = config::save(&on_disk) {
                 s.push(LogKind::System, format!("Couldn't save mic settings: {e:#}"));
             }
@@ -167,6 +207,15 @@ impl Gui {
         }
         let cal = shared.calibration();
 
+        ui.horizontal(|ui| {
+            ui.add_sized([26.0, 18.0], egui::Label::new(theme::silk("VOL")));
+            let mut pct = shared.volume() * 100.0;
+            let r = ui.add(egui::Slider::new(&mut pct, 0.0..=echolink::audio::MAX_VOLUME * 100.0).suffix("%").fixed_decimals(0));
+            if r.changed() {
+                shared.set_volume(pct / 100.0);
+            }
+            save |= r.drag_stopped() || (r.changed() && !r.dragged());
+        });
         ui.horizontal(|ui| {
             ui.add_sized([26.0, 18.0], egui::Label::new(theme::silk("GAIN")));
             let mut db = shared.gain_db();
@@ -237,6 +286,47 @@ impl Gui {
         ui.label(RichText::new(note).small().color(theme::muted()));
         if save {
             self.save_mic_settings();
+        }
+    }
+
+    /// Touch-tone keypad for repeater and conference control.
+    fn keypad(&mut self, ui: &mut egui::Ui) {
+        let Some(s) = &mut self.session else { return };
+        let connected = s.connected();
+        let open = self.keypad_open;
+        let head = ui.add(egui::Button::new(theme::silk(if open { "DTMF KEYPAD  ▾" } else { "DTMF KEYPAD  ▸" })).frame(false));
+        if head.clicked() {
+            self.keypad_open = !open;
+        }
+        if !self.keypad_open {
+            return;
+        }
+        ui.add_enabled_ui(connected, |ui| {
+            egui::Grid::new("dtmf").spacing([6.0, 6.0]).show(ui, |ui| {
+                for row in ["123A", "456B", "789C", "*0#D"] {
+                    for key in row.chars() {
+                        let b = ui.add_sized([44.0, 34.0], egui::Button::new(RichText::new(key.to_string()).monospace().size(16.0)));
+                        if b.clicked() {
+                            s.send_dtmf(&key.to_string());
+                        }
+                    }
+                    ui.end_row();
+                }
+            });
+            ui.horizontal(|ui| {
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut self.dtmf_input).hint_text("digits, e.g. *1234#").desired_width(150.0),
+                );
+                self.dtmf_input.retain(echolink::dtmf::valid);
+                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if (ui.button("SEND").clicked() || enter) && !self.dtmf_input.is_empty() {
+                    s.send_dtmf(&self.dtmf_input);
+                    self.dtmf_input.clear();
+                }
+            });
+        });
+        if !connected {
+            ui.label(RichText::new("Connect to a station to send tones.").small().color(theme::muted()));
         }
     }
 
@@ -674,6 +764,7 @@ impl Gui {
         // Audio meters and mic controls.
         ui.add_space(8.0);
         self.audio_panel(ui);
+        self.keypad(ui);
         let Some(s) = &self.session else { return };
 
         // Messages and chat.
@@ -706,6 +797,10 @@ impl Gui {
         });
     }
 
+    fn hotkey_down_hint(&self) -> bool {
+        self.session.as_ref().is_some_and(|s| s.cfg.ptt_hotkey.is_some()) && cfg!(target_os = "macos")
+    }
+
     fn ptt_button(&mut self, ui: &mut egui::Ui) {
         let Some(s) = &self.session else { return };
         let connected = s.connected();
@@ -721,8 +816,15 @@ impl Gui {
                     true,
                 )
             }
-            None if s.receiving => ("RECEIVING".to_string(), "stand by".to_string(), theme::rx(), false),
-            None if connected => ("PUSH TO TALK".to_string(), "hold here  ·  or hold SPACE".to_string(), theme::accent(), false),
+            None if s.receiving => {
+                let who = match &s.state {
+                    State::Connected { callsign, .. } => callsign.clone(),
+                    _ => String::new(),
+                };
+                let secs = s.rx_since.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                ("RECEIVING".to_string(), format!("{who}  ·  {}:{:02}", secs / 60, secs % 60), theme::rx(), false)
+            }
+            None if connected => ("PUSH TO TALK".to_string(), if self.hotkey_down_hint() { "hold here  ·  SPACE  ·  or your talk key" } else { "hold here  ·  or hold SPACE" }.to_string(), theme::accent(), false),
             None => ("NO LINK".to_string(), "connect to a station to talk".to_string(), theme::edge(), false),
         };
         let size = egui::vec2(ui.available_width(), 88.0);
@@ -776,7 +878,8 @@ impl Gui {
         // Space works while no text box has the keyboard.
         let typing = ctx.memory(|m| m.focused().is_some()) && ctx.wants_keyboard_input();
         let space = !typing && self.settings.is_none() && ctx.input(|i| i.key_down(egui::Key::Space));
-        let want = (self.ptt_held_by_mouse || space) && s.connected();
+        let hotkey = self.hotkey_down.load(Ordering::Relaxed);
+        let want = (self.ptt_held_by_mouse || space || hotkey) && s.connected();
         if want != self.ptt_on {
             self.ptt_on = want;
             s.ptt(want);

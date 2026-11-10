@@ -1,6 +1,6 @@
 [package]
 name = "echolink-tui"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "EchoLink client for the Linux and macOS terminal"
 license = "GPL-2.0-or-later"
@@ -43,3 +43,7 @@ toml = "1.1.8"
 # Window-system backends are only needed on Linux/BSD; macOS uses its native one.
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 eframe = { version = "0.31", default-features = false, features = ["wayland", "x11"], optional = true }
+
+# System-wide push-to-talk key (Carbon hotkeys; needs no extra permission).
+[target.'cfg(target_os = "macos")'.dependencies]
+global-hotkey = "0.7"

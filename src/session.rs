@@ -184,8 +184,48 @@ pub struct Session {
     pub remote_info: String,
     pub log: VecDeque<(LogKind, String)>,
     pub receiving: bool,
+    pub rx_since: Option<Instant>,
     pub tx_since: Option<Instant>,
     pub quitting: bool,
+    dtmf: Sender<String>,
+}
+
+/// Plays touch-tone digits into the transmission, one batch at a time. Keys up
+/// by itself if you aren't already talking, and keeps the microphone out of it.
+fn dtmf_worker(
+    digits: Receiver<String>,
+    cmds: Sender<Cmd>,
+    shared: Arc<audio::Shared>,
+    mic: Sender<Vec<i16>>,
+    transmitting: Arc<AtomicBool>,
+) {
+    use std::time::Duration;
+    std::thread::spawn(move || {
+        while let Ok(first) = digits.recv() {
+            let already_keyed = transmitting.load(Ordering::Relaxed);
+            shared.mute_mic.store(true, Ordering::Relaxed);
+            if !already_keyed {
+                let _ = cmds.send(Cmd::Ptt(true));
+                std::thread::sleep(Duration::from_millis(250)); // let the far end open up
+            }
+            let mut next = Some(first);
+            while let Some(d) = next.take() {
+                let start = Instant::now();
+                for (i, chunk) in crate::dtmf::pcm(&d).chunks(160).enumerate() {
+                    let _ = mic.send(chunk.to_vec());
+                    // Real-time pace, 20 ms per chunk.
+                    let due = start + Duration::from_millis(20 * (i as u64 + 1));
+                    std::thread::sleep(due.saturating_duration_since(Instant::now()));
+                }
+                next = digits.try_recv().ok();
+            }
+            std::thread::sleep(Duration::from_millis(150));
+            if !already_keyed {
+                let _ = cmds.send(Cmd::Ptt(false));
+            }
+            shared.mute_mic.store(false, Ordering::Relaxed);
+        }
+    });
 }
 
 impl Session {
@@ -195,8 +235,10 @@ impl Session {
         crate::log!("{client} {} starting as {}", env!("CARGO_PKG_VERSION"), cfg.callsign);
         let transmitting = Arc::new(AtomicBool::new(false));
         let (mic_tx, mic_rx) = channel();
-        let audio = audio::open(mic_tx, transmitting.clone())?;
+        let dtmf_mic = mic_tx.clone();
+        let audio = audio::open(mic_tx, transmitting.clone(), cfg.input_device.as_deref(), cfg.output_device.as_deref())?;
         crate::log!("audio: {}", audio.description);
+        audio.shared.set_volume(cfg.speaker_volume);
         audio.shared.set_gain_db(cfg.mic_gain_db);
         audio.shared.auto_gain.store(cfg.auto_gain, std::sync::atomic::Ordering::Relaxed);
         audio.shared.denoise.store(cfg.noise_reduction, std::sync::atomic::Ordering::Relaxed);
@@ -230,6 +272,8 @@ impl Session {
                 }
             }
         });
+        let (dtmf, dtmf_rx) = channel();
+        dtmf_worker(dtmf_rx, qso.cmds.clone(), audio.shared.clone(), dtmf_mic, qso.transmitting.clone());
         let mut s = Session {
             cfg,
             audio,
@@ -245,10 +289,15 @@ impl Session {
             remote_info: String::new(),
             log: VecDeque::new(),
             receiving: false,
+            rx_since: None,
             tx_since: None,
             quitting: false,
+            dtmf,
         };
         s.push(LogKind::System, format!("Audio: {}", s.audio.description));
+        for note in s.audio.notes.clone() {
+            s.push(LogKind::System, note);
+        }
         Ok(s)
     }
 
@@ -305,7 +354,10 @@ impl Session {
                 }
                 Event::Info(t) => self.remote_info = t,
                 Event::Chat(t) => self.push(LogKind::Chat, t),
-                Event::Receiving(r) => self.receiving = r,
+                Event::Receiving(r) => {
+                    self.receiving = r;
+                    self.rx_since = if r { self.rx_since.or(Some(Instant::now())) } else { None };
+                }
                 Event::Transmitting(t) => self.tx_since = t.then(Instant::now),
                 Event::Log(t) => self.push(LogKind::System, t),
                 Event::Incoming(_) => {}
@@ -368,6 +420,20 @@ impl Session {
             return;
         }
         let _ = self.cmds.send(Cmd::Ptt(on));
+    }
+
+    /// Send touch tones (0-9, A-D, *, #) to the station you're connected to.
+    pub fn send_dtmf(&mut self, digits: &str) {
+        let digits: String = digits.chars().filter(|&c| crate::dtmf::valid(c)).map(|c| c.to_ascii_uppercase()).collect();
+        if digits.is_empty() {
+            return;
+        }
+        if !self.connected() {
+            self.push(LogKind::System, "Connect to a station before sending DTMF.".into());
+            return;
+        }
+        self.push(LogKind::System, format!("DTMF sent: {digits}"));
+        let _ = self.dtmf.send(digits);
     }
 
     pub fn chat(&mut self, text: &str) {
