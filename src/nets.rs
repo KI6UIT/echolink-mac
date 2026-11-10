@@ -40,7 +40,7 @@ pub struct Net {
 }
 
 /// A net's own page.
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct Detail {
     pub name: String,
     pub slots: Vec<Slot>,
@@ -50,7 +50,7 @@ pub struct Detail {
     pub echolink_node: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Slot {
     /// `8:30 PM Sunday` and the time zone it was written in.
     pub local: String,
@@ -241,14 +241,18 @@ pub fn local_offset_minutes() -> i32 {
     0
 }
 
-/// A UTC slot like `01:30 Monday` as it falls in your time zone: `Sun 8:30 PM`.
-pub fn in_my_time(utc: &str, offset_min: i32) -> Option<String> {
+/// A UTC slot like `01:30 Monday` as minutes into the week (Monday 00:00 UTC = 0).
+pub fn week_minute(utc: &str) -> Option<i32> {
     let mut parts = utc.split_whitespace();
     let (h, m) = parts.next()?.split_once(':')?;
     let name = parts.next()?;
     let day = DAYS.iter().position(|d| d.eq_ignore_ascii_case(name))? as i32;
-    let total = day * 1440 + h.parse::<i32>().ok()? * 60 + m.parse::<i32>().ok()? + offset_min;
-    let total = total.rem_euclid(7 * 1440);
+    Some(day * 1440 + h.parse::<i32>().ok()? * 60 + m.parse::<i32>().ok()?)
+}
+
+/// `Sun 8:30 PM` for a minute of the week.
+fn label_of(week_minute: i32) -> String {
+    let total = week_minute.rem_euclid(7 * 1440);
     let (day, minute) = (total / 1440, total % 1440);
     let (h24, mi) = (minute / 60, minute % 60);
     let (h12, ampm) = match h24 {
@@ -257,7 +261,60 @@ pub fn in_my_time(utc: &str, offset_min: i32) -> Option<String> {
         12 => (12, "PM"),
         _ => (h24 - 12, "PM"),
     };
-    Some(format!("{} {h12}:{mi:02} {ampm}", &DAYS[day as usize][..3]))
+    format!("{} {h12}:{mi:02} {ampm}", &DAYS[day as usize][..3])
+}
+
+/// A UTC slot like `01:30 Monday` as it falls in your time zone: `Sun 8:30 PM`.
+pub fn in_my_time(utc: &str, offset_min: i32) -> Option<String> {
+    Some(label_of(week_minute(utc)? + offset_min))
+}
+
+/// The days a net meets in YOUR time zone (Monday first), from its page. `None` if its
+/// page has no readable times.
+pub fn local_days(d: &Detail, offset_min: i32) -> Option<[bool; 7]> {
+    let mut days = [false; 7];
+    let mut any = false;
+    for s in &d.slots {
+        if let Some(w) = week_minute(&s.utc) {
+            days[((w + offset_min).rem_euclid(7 * 1440) / 1440) as usize] = true;
+            any = true;
+        }
+    }
+    any.then_some(days)
+}
+
+/// When a net starts, in your time zone, for the list: `Mon 8:30 PM`, with `+2` if it
+/// meets at more than one time.
+pub fn local_start(d: &Detail, offset_min: i32) -> Option<String> {
+    let mut times: Vec<i32> = d.slots.iter().filter_map(|s| week_minute(&s.utc)).map(|w| (w + offset_min).rem_euclid(7 * 1440)).collect();
+    times.sort();
+    let first = *times.first()?;
+    Some(if times.len() > 1 { format!("{} +{}", label_of(first), times.len() - 1) } else { label_of(first) })
+}
+
+/// Minutes from `now` (Unix time) until the net next starts, within the coming week.
+pub fn minutes_until_next(d: &Detail, now: i64) -> Option<i32> {
+    let now_week = (weekday(now) as i64 * 1440 + now.rem_euclid(86400) / 60) as i32;
+    d.slots.iter().filter_map(|s| week_minute(&s.utc)).map(|w| (w - now_week).rem_euclid(7 * 1440)).min()
+}
+
+// ---- schedules kept on disk (a net's times rarely change) ------------------------------
+
+/// How long a net's page is trusted before it is read again.
+pub const DETAIL_MAX_AGE_SECS: i64 = 7 * 24 * 3600;
+
+fn details_path() -> std::path::PathBuf {
+    crate::config::path().with_file_name("nets-details.json")
+}
+
+pub fn load_details() -> std::collections::HashMap<String, (i64, Detail)> {
+    std::fs::read_to_string(details_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+pub fn save_details(all: &std::collections::HashMap<String, (i64, Detail)>) {
+    if let Ok(text) = serde_json::to_string(all) {
+        let _ = std::fs::write(details_path(), text);
+    }
 }
 
 #[cfg(test)]
@@ -348,6 +405,36 @@ mod tests {
             println!("{d:#?}");
             assert!(!d.name.is_empty() && !d.slots.is_empty());
         }
+    }
+
+    #[test]
+    fn a_nets_days_and_start_in_your_zone() {
+        let slot = |utc: &str| Slot { local: String::new(), timezone: String::new(), utc: utc.into(), frequency: String::new() };
+        let gara = Detail { slots: vec![slot("01:30 Monday")], ..Default::default() };
+        // 01:30 Monday UTC is Sunday evening in the US Central zone (UTC-6).
+        assert_eq!(local_days(&gara, -360), Some([false, false, false, false, false, false, true]));
+        assert_eq!(local_start(&gara, -360).as_deref(), Some("Sun 7:30 PM"));
+        assert_eq!(local_days(&gara, 0), Some([true, false, false, false, false, false, false]));
+        let twice = Detail { slots: vec![slot("01:30 Monday"), slot("14:00 Thursday")], ..Default::default() };
+        let d = local_days(&twice, -360).unwrap();
+        assert!(d[6] && d[3] && d.iter().filter(|x| **x).count() == 2);
+        assert_eq!(local_start(&twice, -360).as_deref(), Some("Thu 8:00 AM +1"));
+        assert_eq!(local_days(&Detail::default(), 0), None);
+        assert_eq!(local_start(&Detail::default(), 0), None);
+    }
+
+    #[test]
+    fn minutes_until_a_net_starts() {
+        let slot = |utc: &str| Slot { local: String::new(), timezone: String::new(), utc: utc.into(), frequency: String::new() };
+        let d = Detail { slots: vec![slot("01:30 Monday")], ..Default::default() };
+        // 2023-11-13 was a Monday; midnight UTC.
+        let monday_midnight = 1_699_833_600;
+        assert_eq!(weekday(monday_midnight), 0);
+        assert_eq!(minutes_until_next(&d, monday_midnight), Some(90));
+        assert_eq!(minutes_until_next(&d, monday_midnight + 2 * 3600), Some(7 * 1440 - 30), "just missed it: next week");
+        let two = Detail { slots: vec![slot("01:30 Monday"), slot("23:00 Sunday")], ..Default::default() };
+        assert_eq!(minutes_until_next(&two, monday_midnight), Some(90), "the soonest of several");
+        assert_eq!(minutes_until_next(&Detail::default(), 0), None);
     }
 
     #[test]

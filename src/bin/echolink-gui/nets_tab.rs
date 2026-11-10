@@ -4,12 +4,29 @@
 use super::*;
 use echolink::nets::{self, Detail, Net};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, channel};
+use std::sync::Arc;
 
 enum Msg {
     Progress(usize, usize),
     Done(Vec<Net>),
     Failed(String),
+}
+
+/// The one-time read of every net's page, to get their times.
+enum TimesMsg {
+    One(String, Detail),
+    /// Stopped early, with why (empty if cancelled).
+    Stopped(String),
+    Done,
+}
+
+struct TimesJob {
+    rx: Receiver<TimesMsg>,
+    cancel: Arc<AtomicBool>,
+    done: usize,
+    total: usize,
 }
 
 #[derive(Default)]
@@ -29,8 +46,29 @@ pub struct NetsUi {
     today_only: bool,
     /// The nets that pass the filters, as indexes into `nets`, and what that was worked out for.
     visible: Vec<usize>,
-    visible_for: Option<(String, String, bool, usize, usize)>,
+    visible_for: Option<(String, String, bool, usize, usize, bool, bool)>,
     offset_min: Option<i32>,
+    /// Every net's page that has been read, with when. Kept on disk for a week.
+    times: HashMap<String, (i64, Detail)>,
+    job: Option<TimesJob>,
+    times_note: Option<String>,
+    sort_soonest: bool,
+}
+
+impl NetsUi {
+    /// Nets whose page has been read recently enough to trust.
+    fn fresh(&self, slug: &str, now: i64) -> Option<&Detail> {
+        self.times.get(slug).filter(|(at, _)| now - at < nets::DETAIL_MAX_AGE_SECS).map(|(_, d)| d)
+    }
+
+    fn known(&self, now: i64) -> usize {
+        self.nets.iter().filter(|n| self.fresh(&n.slug, now).is_some()).count()
+    }
+
+    /// Times for nearly every net: show everything in your own time zone.
+    fn local_mode(&self, now: i64) -> bool {
+        !self.nets.is_empty() && self.known(now) * 10 >= self.nets.len() * 9
+    }
 }
 
 impl Gui {
@@ -42,6 +80,12 @@ impl Gui {
             if let Some((at, list)) = nets::load_cache() {
                 self.nets.nets = list;
                 self.nets.fetched_at = Some(at);
+            }
+            self.nets.times = nets::load_details();
+            let now = echolink::contacts::now();
+            let saved: Vec<(String, Detail)> = self.nets.times.iter().filter(|(_, (at, _))| now - at < nets::DETAIL_MAX_AGE_SECS).map(|(k, (_, d))| (k.clone(), d.clone())).collect();
+            for (slug, d) in saved {
+                self.nets.details.insert(slug, Ok(d)); // so a net opens at once
             }
             let stale = self.nets.fetched_at.is_none_or(|t| echolink::contacts::now() - t > nets::MAX_AGE_SECS);
             if stale {
@@ -88,6 +132,49 @@ impl Gui {
         });
     }
 
+    /// Read every net's page, once, a second apart, so days and times can be shown in your time zone.
+    fn nets_load_times(&mut self, ctx: &egui::Context) {
+        let now = echolink::contacts::now();
+        let todo: Vec<String> = self.nets.nets.iter().filter(|n| self.nets.fresh(&n.slug, now).is_none()).map(|n| n.slug.clone()).collect();
+        if todo.is_empty() || self.nets.job.is_some() {
+            return;
+        }
+        let (tx, rx) = channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.nets.job = Some(TimesJob { rx, cancel: cancel.clone(), done: 0, total: todo.len() });
+        self.nets.times_note = None;
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let mut failures = 0;
+            for (i, slug) in todo.iter().enumerate() {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = tx.send(TimesMsg::Stopped(String::new()));
+                    return;
+                }
+                if i > 0 {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+                match nets::fetch_detail(nets::SITE, slug) {
+                    Ok(d) => {
+                        failures = 0;
+                        let _ = tx.send(TimesMsg::One(slug.clone(), d));
+                    }
+                    Err(e) => {
+                        failures += 1;
+                        if failures >= 3 {
+                            let _ = tx.send(TimesMsg::Stopped(e));
+                            ctx.request_repaint();
+                            return;
+                        }
+                    }
+                }
+                ctx.request_repaint();
+            }
+            let _ = tx.send(TimesMsg::Done);
+            ctx.request_repaint();
+        });
+    }
+
     fn nets_select(&mut self, ctx: &egui::Context, slug: &str) {
         self.nets.selected = Some(slug.to_string());
         if self.nets.details.contains_key(slug) || self.nets.pending.iter().any(|(s, _)| s == slug) {
@@ -128,6 +215,28 @@ impl Gui {
                 n.rx = None;
             }
         }
+        if let Some(job) = &mut n.job {
+            let mut end = None;
+            while let Ok(m) = job.rx.try_recv() {
+                match m {
+                    TimesMsg::One(slug, d) => {
+                        job.done += 1;
+                        n.details.insert(slug.clone(), Ok(d.clone()));
+                        n.times.insert(slug, (echolink::contacts::now(), d));
+                        if job.done % 20 == 0 {
+                            nets::save_details(&n.times);
+                        }
+                    }
+                    TimesMsg::Stopped(why) => end = Some(why),
+                    TimesMsg::Done => end = Some(String::new()),
+                }
+            }
+            if let Some(why) = end {
+                nets::save_details(&n.times);
+                n.times_note = (!why.is_empty()).then(|| format!("Stopped: {why}. What was read is kept; press the button to carry on."));
+                n.job = None;
+            }
+        }
         let mut still = Vec::new();
         for (slug, rx) in std::mem::take(&mut n.pending) {
             match rx.try_recv() {
@@ -144,11 +253,16 @@ impl Gui {
     fn nets_list(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let now = echolink::contacts::now();
-        let today = nets::weekday(now);
+        let offset = *self.nets.offset_min.get_or_insert_with(nets::local_offset_minutes);
+        let utc_today = nets::weekday(now);
+        let my_today = nets::weekday(now + i64::from(offset) * 60);
+        let local = self.nets.local_mode(now);
+        // The day that counts as "today": yours once times are known, otherwise UTC's.
+        let today = if local { my_today } else { utc_today };
         let loading = self.nets.rx.is_some();
         let can_refresh = !loading && self.nets.fetched_at.is_none_or(|t| now - t >= nets::MIN_REFRESH_SECS);
 
-        let mut refresh = false;
+        let (mut refresh, mut load_times, mut cancel_times) = (false, false, false);
         ui.horizontal_wrapped(|ui| {
             refresh = ui
                 .add_enabled(can_refresh, egui::Button::new(if loading { "LOADING…" } else { "REFRESH" }))
@@ -169,8 +283,50 @@ impl Gui {
                     ui.selectable_value(&mut self.nets.band, b.to_string(), b);
                 }
             });
-            ui.checkbox(&mut self.nets.today_only, format!("On today ({})", &nets::DAYS[today][..3])).on_hover_text("Only nets that meet on today's UTC day");
+            if local {
+                ui.checkbox(&mut self.nets.today_only, format!("On today ({})", &nets::DAYS[today][..3])).on_hover_text("Nets that meet on today's date where you are");
+                ui.checkbox(&mut self.nets.sort_soonest, "Soonest first").on_hover_text("Order by which net starts next");
+            } else {
+                ui.checkbox(&mut self.nets.today_only, format!("On UTC {}", &nets::DAYS[today][..3]))
+                    .on_hover_text("Only nets that meet on the current UTC day. NetFinder lists days in UTC, so a net can be on tomorrow's UTC day while it is still evening for you.");
+            }
         });
+
+        // Days in your time zone need each net's time, which is on its own page.
+        if let Some(job) = &self.nets.job {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(format!("Reading net times… {} of {}", job.done, job.total)).small().color(theme::accent()));
+                if ui.small_button("CANCEL").clicked() {
+                    cancel_times = true;
+                }
+            });
+        } else if local {
+            ui.label(RichText::new("Days and times are in your time zone.").small().color(theme::muted()));
+        } else {
+            let todo = self.nets.nets.len().saturating_sub(self.nets.known(now));
+            ui.horizontal_wrapped(|ui| {
+                let days_note = if my_today == utc_today {
+                    format!("Days are in UTC (it's {} here and in UTC).", nets::DAYS[utc_today])
+                } else {
+                    format!("Days are in UTC: it's {} where you are, but {} in UTC.", nets::DAYS[my_today], nets::DAYS[utc_today])
+                };
+                ui.label(RichText::new(days_note).small().color(theme::muted()));
+                if todo > 0
+                    && ui
+                        .small_button("SHOW IN MY TIME ZONE")
+                        .on_hover_text(format!(
+                            "Needs each net's time, which is only on its own page: {todo} page requests to NetFinder, one per second (about {} minutes), once. The times are kept for a week.",
+                            todo.div_ceil(60)
+                        ))
+                        .clicked()
+                {
+                    load_times = true;
+                }
+            });
+        }
+        if let Some(note) = &self.nets.times_note {
+            ui.label(RichText::new(note).small().color(theme::tx()));
+        }
 
         let status = if let Some((d, t)) = self.nets.progress {
             if t == 0 { "Reading the net list from NetFinder…".to_string() } else { format!("Reading the net list from NetFinder… page {d} of {t}") }
@@ -189,26 +345,35 @@ impl Gui {
             }
         });
 
-        // Which nets pass the filters.
-        let key = (self.nets.search.trim().to_lowercase(), self.nets.band.clone(), self.nets.today_only, self.nets.nets.len(), today);
+        // Which nets pass the filters, and in what order. A net's days are yours when its page has been read.
+        let days_of = |ui_state: &NetsUi, n: &Net| -> ([bool; 7], bool) {
+            if local && let Some(d) = ui_state.fresh(&n.slug, now) && let Some(days) = nets::local_days(d, offset) {
+                return (days, true);
+            }
+            (n.days, false)
+        };
+        let key = (self.nets.search.trim().to_lowercase(), self.nets.band.clone(), self.nets.today_only, self.nets.nets.len(), today, local, self.nets.sort_soonest);
         if self.nets.visible_for.as_ref() != Some(&key) {
-            self.nets.visible = self
+            let mut idx: Vec<usize> = self
                 .nets
                 .nets
                 .iter()
                 .enumerate()
                 .filter(|(_, n)| {
-                    (key.0.is_empty() || n.name.to_lowercase().contains(&key.0))
-                        && (key.1.is_empty() || n.band == key.1)
-                        && (!key.2 || n.days[today])
+                    (key.0.is_empty() || n.name.to_lowercase().contains(&key.0)) && (key.1.is_empty() || n.band == key.1) && (!key.2 || days_of(&self.nets, n).0[today])
                 })
                 .map(|(i, _)| i)
                 .collect();
+            if local && self.nets.sort_soonest {
+                let soon = |i: &usize| self.nets.fresh(&self.nets.nets[*i].slug, now).and_then(|d| nets::minutes_until_next(d, now)).unwrap_or(i32::MAX);
+                idx.sort_by_key(soon);
+            }
+            self.nets.visible = idx;
             self.nets.visible_for = Some(key);
         }
         ui.label(RichText::new(format!("{} shown", self.nets.visible.len())).small().color(theme::muted()));
 
-        let compact = ui.available_width() < 520.0;
+        let compact = ui.available_width() < 560.0;
         let table_height = ui.available_height().max(100.0);
         let mut picked: Option<String> = None;
         let selected = self.nets.selected.clone();
@@ -217,15 +382,26 @@ impl Gui {
             .sense(egui::Sense::click())
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .column(Column::remainder().at_least(120.0).clip(true))
-            .column(Column::exact(94.0))
-            .column(Column::exact(74.0));
+            .column(Column::exact(94.0));
+        if local && !compact {
+            table = table.column(Column::exact(96.0));
+        }
+        table = table.column(Column::exact(74.0));
         if !compact {
-            table = table.column(Column::initial(150.0).clip(true));
+            table = table.column(Column::initial(130.0).clip(true));
         }
         table
             .max_scroll_height(table_height)
             .header(22.0, |mut h| {
-                let heads: &[&str] = if compact { &["Net", "Days (UTC)", "Band"] } else { &["Net", "Days (UTC)", "Band", "Type"] };
+                let days_head = if local { "Days (you)" } else { "Days (UTC)" };
+                let mut heads = vec!["Net", days_head];
+                if local && !compact {
+                    heads.push("Starts");
+                }
+                heads.push("Band");
+                if !compact {
+                    heads.push("Type");
+                }
                 for t in heads {
                     h.col(|ui| {
                         ui.label(theme::silk(t));
@@ -235,6 +411,7 @@ impl Gui {
             .body(|body| {
                 body.rows(24.0, self.nets.visible.len(), |mut row| {
                     let n = &self.nets.nets[self.nets.visible[row.index()]];
+                    let (days, exact) = days_of(&self.nets, n);
                     row.set_selected(selected.as_deref() == Some(n.slug.as_str()));
                     row.col(|ui| {
                         ui.label(RichText::new(&n.name).size(13.0));
@@ -243,15 +420,29 @@ impl Gui {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 3.0;
                             for (i, letter) in "MTWTFSS".chars().enumerate() {
-                                let color = match (n.days[i], i == today) {
+                                // Faded when these are UTC days because the net's time isn't known yet.
+                                let fade = if local && !exact { 0.6 } else { 1.0 };
+                                let color = match (days[i], i == today) {
                                     (true, true) => theme::rx(),
-                                    (true, false) => theme::accent(),
+                                    (true, false) => theme::accent().gamma_multiply(fade),
                                     _ => theme::muted().gamma_multiply(0.4),
                                 };
-                                ui.label(RichText::new(letter.to_string()).monospace().size(12.0).color(color));
+                                let mut text = RichText::new(letter.to_string()).monospace().size(12.0).color(color);
+                                if !local && i == my_today && my_today != utc_today {
+                                    text = text.underline(); // your own day, when it differs from UTC's
+                                }
+                                let basis = if local && exact { "your time" } else { "UTC" };
+                                let tip = format!("{} ({basis}){}", nets::DAYS[i], if days[i] { ": meets" } else { ": no net" });
+                                ui.label(text).on_hover_text(tip);
                             }
                         });
                     });
+                    if local && !compact {
+                        row.col(|ui| {
+                            let start = self.nets.fresh(&n.slug, now).and_then(|d| nets::local_start(d, offset)).unwrap_or_else(|| "-".into());
+                            ui.label(RichText::new(start).monospace().size(12.0));
+                        });
+                    }
                     row.col(|ui| {
                         ui.label(RichText::new(&n.band).small().color(theme::muted()));
                     });
@@ -269,6 +460,12 @@ impl Gui {
 
         if refresh {
             self.nets_fetch(&ctx);
+        }
+        if load_times {
+            self.nets_load_times(&ctx);
+        }
+        if cancel_times && let Some(job) = &self.nets.job {
+            job.cancel.store(true, Ordering::Relaxed);
         }
         if let Some(slug) = picked {
             self.nets_select(&ctx, &slug);

@@ -73,6 +73,12 @@ directory of amateur radio nets.
   frequency, organizer, location and website.
 - **JOIN NOW** connects to the net's EchoLink node when it's online.
 
+**Days and times.** NetFinder lists days in UTC, and the list has no times, so at first the day
+letters are UTC and the tab says so. Press **SHOW IN MY TIME ZONE** to read each net's own page once
+(about 230 requests, one per second, only when you ask; kept for a week). After that days and times
+are in your time zone, today means *your* today, a **Starts** column shows when each net begins, and
+**Soonest first** orders them by what's next.
+
 NetFinder has no API, so the app reads its public pages. It identifies itself as EchoLinkMac, reads
 nothing until you open the tab, keeps the list on your Mac for a day (REFRESH waits at least ten
 minutes), fetches one page per second, and links every net back to its NetFinder page. If NetFinder
@@ -241,6 +247,7 @@ Try ECHOTEST (node 9999) first. It plays back what you say.
 | Theme | `~/Library/Application Support/echolink-tui/gui-theme` |
 | Divider positions and gauge order | `~/Library/Application Support/echolink-tui/gui-layout` |
 | Net list (cached for a day) | `~/Library/Application Support/echolink-tui/nets-cache.json` |
+| Net times (cached for a week) | `~/Library/Application Support/echolink-tui/nets-details.json` |
 | Your contacts | `~/Library/Application Support/echolink-tui/contacts.jsonl` |
 | Copy of your QRZ logbook | `~/Library/Application Support/echolink-tui/qrz-logbook.jsonl` |
 | Activity log | `~/Library/Application Support/echolink-tui/activity.log` |
