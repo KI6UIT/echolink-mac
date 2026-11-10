@@ -23,6 +23,7 @@ directory, shows who's on, and carries your voice both ways.
 - **Swing-needle gauges** for RX, MIC, LINK, COMP and NR (see below). The mic gauge is live
   before you key up
 - **Logbook** with QRZ sync, upload, ADIF export, editing and callsign lookups (see below)
+- **Nets**: find EchoLink nets, see when they meet in your time zone, and join in one click (see below)
 - **Call control**: block list, allow-only list and Do Not Disturb
 - **Audio tools** (see below): mic gain, **AUTO-SET**, **Auto level**, **noise reduction**
   and speaker volume
@@ -60,6 +61,23 @@ station log.
   details, bio and your history with them. QRZ gives full details to XML subscribers only.
 
 Your key and login stay in your settings file (permissions 600) and go only to QRZ.
+
+## Nets
+
+The **NETS** tab lists EchoLink nets from [NetFinder](https://netfinder.radio), a community-run
+directory of amateur radio nets.
+
+- Search by name, filter by band, or tick **On today** to see nets that meet on today's (UTC) day.
+  Each row shows the days it meets (today's lit green), the band and the type.
+- Click a net for its schedule in UTC, in the net's own time zone and in **your** time zone, plus the
+  frequency, organizer, location and website.
+- **JOIN NOW** connects to the net's EchoLink node when it's online.
+
+NetFinder has no API, so the app reads its public pages. It identifies itself as EchoLinkMac, reads
+nothing until you open the tab, keeps the list on your Mac for a day (REFRESH waits at least ten
+minutes), fetches one page per second, and links every net back to its NetFinder page. If NetFinder
+changes its layout the tab says so instead of showing wrong data. Net details are kept up to date by
+NetFinder's users, so check a net's own page before you go.
 
 ## Call control
 
@@ -207,6 +225,7 @@ Try ECHOTEST (node 9999) first. It plays back what you say.
 | Settings, including favorites, audio and devices | `~/Library/Application Support/echolink-tui/config.toml` (permissions 600) |
 | Theme | `~/Library/Application Support/echolink-tui/gui-theme` |
 | Divider positions and gauge order | `~/Library/Application Support/echolink-tui/gui-layout` |
+| Net list (cached for a day) | `~/Library/Application Support/echolink-tui/nets-cache.json` |
 | Your contacts | `~/Library/Application Support/echolink-tui/contacts.jsonl` |
 | Copy of your QRZ logbook | `~/Library/Application Support/echolink-tui/qrz-logbook.jsonl` |
 | Activity log | `~/Library/Application Support/echolink-tui/activity.log` |

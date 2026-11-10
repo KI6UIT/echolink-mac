@@ -759,6 +759,7 @@ dependencies = [
  "md5",
  "nnnoiseless",
  "ratatui",
+ "regex",
  "rpassword",
  "serde",
  "serde_json",

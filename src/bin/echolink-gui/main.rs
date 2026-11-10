@@ -1,6 +1,7 @@
 //! EchoLink desktop app: the same station core as echolink-tui, with a
 //! window, a big push-to-talk button and a settings dialog.
 
+mod nets_tab;
 mod settings;
 mod theme;
 
@@ -75,6 +76,7 @@ fn main() -> eframe::Result {
 enum Tab {
     Station,
     Logbook,
+    Nets,
 }
 
 /// The open QRZ profile window.
@@ -159,6 +161,7 @@ struct Gui {
     keypad_open: bool,
     tab: Tab,
     page: Option<PageWin>,
+    nets: nets_tab::NetsUi,
     /// The selected logbook entry (its key), and the edit / delete dialogs.
     book_sel: Option<String>,
     edit: Option<EditForm>,
@@ -211,6 +214,7 @@ impl Gui {
             keypad_open: false,
             tab: Tab::Station,
             page: None,
+            nets: Default::default(),
             book_sel: None,
             edit: None,
             del: None,
@@ -347,12 +351,15 @@ impl Gui {
 
     /// STATION LOG | LOGBOOK.
     fn tab_row(tab: &mut Tab, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if theme::tab_button(ui, "STATION LOG", *tab == Tab::Station) {
                 *tab = Tab::Station;
             }
             if theme::tab_button(ui, "LOGBOOK", *tab == Tab::Logbook) {
                 *tab = Tab::Logbook;
+            }
+            if theme::tab_button(ui, "NETS", *tab == Tab::Nets) {
+                *tab = Tab::Nets;
             }
         });
     }
@@ -1698,6 +1705,10 @@ impl Gui {
         Gui::tab_row(&mut self.tab, ui);
         if self.tab == Tab::Logbook {
             self.logbook_tab(ui);
+            return;
+        }
+        if self.tab == Tab::Nets {
+            self.nets_tab(ui);
             return;
         }
         let log_height = (ui.available_height() - 40.0).max(60.0);

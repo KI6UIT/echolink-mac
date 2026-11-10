@@ -11,6 +11,7 @@ pub mod log;
 pub mod lookup;
 pub mod logbook;
 pub mod net;
+pub mod nets;
 pub mod proxy;
 pub mod qrz;
 pub mod qso;
