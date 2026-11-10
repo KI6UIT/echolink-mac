@@ -28,6 +28,15 @@ pub struct Config {
     /// Starred stations (callsigns), shown first in the desktop app.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub favorites: Vec<String>,
+    /// Software gain on the microphone, in dB (0 = as the sound card delivers it).
+    #[serde(default)]
+    pub mic_gain_db: f32,
+    /// Automatic gain control: keeps your voice in the yellow and out of the red.
+    #[serde(default)]
+    pub auto_gain: bool,
+    /// Remove background (room) noise from your microphone.
+    #[serde(default)]
+    pub noise_reduction: bool,
 }
 
 impl Config {
@@ -43,6 +52,9 @@ impl Config {
             proxy: None,
             proxy_password: None,
             favorites: Vec::new(),
+            mic_gain_db: 0.0,
+            auto_gain: false,
+            noise_reduction: false,
         }
     }
 }
@@ -141,6 +153,9 @@ pub fn setup() -> Result<()> {
         proxy,
         proxy_password: old.as_ref().and_then(|c| c.proxy_password.clone()),
         favorites: old.as_ref().map(|c| c.favorites.clone()).unwrap_or_default(),
+        mic_gain_db: old.as_ref().map(|c| c.mic_gain_db).unwrap_or(0.0),
+        auto_gain: old.as_ref().map(|c| c.auto_gain).unwrap_or(false),
+        noise_reduction: old.as_ref().map(|c| c.noise_reduction).unwrap_or(false),
     };
     save(&cfg)?;
     println!("\nSaved to {} (readable only by you).", path().display());

@@ -12,7 +12,7 @@ use echolink::session::{Filter, LogKind, Session, Update};
 use egui_extras::{Column, TableBuilder};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const ECHOTEST_NODE: u32 = 9999;
 const RESTART_ENV: &str = "ECHOLINK_GUI_RESTARTED";
@@ -49,6 +49,11 @@ struct Gui {
     closing: bool,
     /// Whether the window has focus; notifications only pop up when it doesn't.
     focused: Arc<AtomicBool>,
+    /// Mic clip lamp: last seen clip count, and when the lamp goes out.
+    last_clips: u32,
+    clip_until: Option<Instant>,
+    /// Result of the last auto-set, shown under the mic controls.
+    mic_note: String,
 }
 
 impl Gui {
@@ -69,6 +74,9 @@ impl Gui {
             ptt_on: false,
             closing: false,
             focused: Arc::new(AtomicBool::new(true)),
+            last_clips: 0,
+            clip_until: None,
+            mic_note: String::new(),
         };
         match config::load() {
             Ok(cfg) => {
@@ -113,6 +121,123 @@ impl Gui {
         // Favorites first, then alphabetical (the list is already sorted).
         v.sort_by_key(|&i| !favs.iter().any(|f| f == &s.stations[i].callsign));
         self.visible = v;
+    }
+
+    /// Save the mic settings onto whatever is on disk.
+    fn save_mic_settings(&mut self) {
+        let Some(s) = &mut self.session else { return };
+        s.cfg.mic_gain_db = s.audio.shared.gain_db();
+        s.cfg.auto_gain = s.audio.shared.auto_gain.load(Ordering::Relaxed);
+        s.cfg.noise_reduction = s.audio.shared.denoise.load(Ordering::Relaxed);
+        if let Ok(mut on_disk) = config::load() {
+            on_disk.mic_gain_db = s.cfg.mic_gain_db;
+            on_disk.auto_gain = s.cfg.auto_gain;
+            on_disk.noise_reduction = s.cfg.noise_reduction;
+            if let Err(e) = config::save(&on_disk) {
+                s.push(LogKind::System, format!("Couldn't save mic settings: {e:#}"));
+            }
+        }
+    }
+
+    /// RX and MIC level meters, mic gain, auto-set and auto-level.
+    /// Aim: speech peaks in the yellow (heard), never the red (clipping).
+    fn audio_panel(&mut self, ui: &mut egui::Ui) {
+        use echolink::audio::{CalState, GAIN_MAX_DB, GAIN_MIN_DB};
+        let Some(s) = &self.session else { return };
+        let shared = s.audio.shared.clone();
+        let rx = shared.rx_level.load(Ordering::Relaxed) as f32 / 1000.0;
+        let mic = shared.mic_level.load(Ordering::Relaxed) as f32 / 1000.0;
+        theme::led_meter(ui, "RX", rx, true);
+        theme::led_meter(ui, "MIC", mic, true);
+
+        let clips = shared.clips.load(Ordering::Relaxed);
+        if clips != self.last_clips {
+            self.last_clips = clips;
+            self.clip_until = Some(Instant::now() + Duration::from_millis(1500));
+        }
+        let clipping = self.clip_until.is_some_and(|t| Instant::now() < t);
+
+        let mut save = false;
+        if let Some(result) = shared.take_calibration_result() {
+            self.mic_note = match result {
+                CalState::Done(db) => format!("Mic gain set to {db:+.1} dB. Your voice should now reach the yellow."),
+                _ => "Couldn't hear the microphone. Check that it isn't muted and that the right input is selected in System Settings, then try again.".into(),
+            };
+            save = matches!(result, CalState::Done(_));
+        }
+        let cal = shared.calibration();
+
+        ui.horizontal(|ui| {
+            ui.add_sized([26.0, 18.0], egui::Label::new(theme::silk("GAIN")));
+            let mut db = shared.gain_db();
+            let r = ui.add_enabled(
+                !matches!(cal, CalState::Listening(_)),
+                egui::Slider::new(&mut db, GAIN_MIN_DB..=GAIN_MAX_DB).suffix(" dB").step_by(0.5).fixed_decimals(1),
+            );
+            if r.changed() {
+                shared.set_gain_db(db);
+                self.mic_note.clear();
+            }
+            save |= r.drag_stopped() || (r.changed() && !r.dragged());
+        });
+        ui.horizontal(|ui| {
+            match cal {
+                CalState::Listening(p) => {
+                    if ui.button("CANCEL").clicked() {
+                        shared.cancel_calibration();
+                    }
+                    ui.label(
+                        RichText::new(format!(
+                            "Listening… keep talking at your normal level ({:.0} s)",
+                            (1.0 - p) * echolink::audio::CAL_SECONDS
+                        ))
+                        .color(theme::accent()),
+                    );
+                }
+                _ => {
+                    if ui
+                        .button("AUTO-SET")
+                        .on_hover_text("Talk normally for 5 seconds and the gain is set so your voice peaks in the yellow without touching the red")
+                        .clicked()
+                    {
+                        self.mic_note.clear();
+                        shared.start_calibration();
+                    }
+                    let mut auto = shared.auto_gain.load(Ordering::Relaxed);
+                    if ui
+                        .checkbox(&mut auto, "Auto level")
+                        .on_hover_text("Keeps adjusting while you talk: lifts quiet speech, pulls loud speech down, and never lets a peak reach the red")
+                        .changed()
+                    {
+                        shared.auto_gain.store(auto, Ordering::Relaxed);
+                        save = true;
+                    }
+                    let mut quiet = shared.denoise.load(Ordering::Relaxed);
+                    if ui
+                        .checkbox(&mut quiet, "Noise reduction")
+                        .on_hover_text("Removes background noise from the room (fans, keyboard, hum) using the open-source RNNoise filter")
+                        .changed()
+                    {
+                        shared.denoise.store(quiet, Ordering::Relaxed);
+                        save = true;
+                    }
+                    let (text, color) = if clipping { ("CLIP", theme::tx()) } else { ("clip", theme::muted()) };
+                    ui.label(RichText::new(text).monospace().color(color))
+                        .on_hover_text("Lights when the mic signal hits full scale. Turn the gain down.");
+                }
+            }
+        });
+        let note = if !self.mic_note.is_empty() {
+            self.mic_note.as_str()
+        } else if clipping {
+            "Too loud: the red is lit. Lower the gain, or use Auto level."
+        } else {
+            "Talk normally: the MIC bar should reach the yellow, not the red."
+        };
+        ui.label(RichText::new(note).small().color(theme::muted()));
+        if save {
+            self.save_mic_settings();
+        }
     }
 
     fn toggle_favorite(&mut self, call: &str) {
@@ -546,13 +671,10 @@ impl Gui {
         ui.add_space(10.0);
         self.ptt_button(ui);
 
-        // Audio meters.
-        let Some(s) = &self.session else { return };
+        // Audio meters and mic controls.
         ui.add_space(8.0);
-        let rx = s.audio.shared.rx_level.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0;
-        let tx = s.audio.shared.tx_level.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0;
-        theme::led_meter(ui, "RX", rx, true);
-        theme::led_meter(ui, "TX", tx, true);
+        self.audio_panel(ui);
+        let Some(s) = &self.session else { return };
 
         // Messages and chat.
         ui.add_space(10.0);

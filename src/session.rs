@@ -197,6 +197,9 @@ impl Session {
         let (mic_tx, mic_rx) = channel();
         let audio = audio::open(mic_tx, transmitting.clone())?;
         crate::log!("audio: {}", audio.description);
+        audio.shared.set_gain_db(cfg.mic_gain_db);
+        audio.shared.auto_gain.store(cfg.auto_gain, std::sync::atomic::Ordering::Relaxed);
+        audio.shared.denoise.store(cfg.noise_reduction, std::sync::atomic::Ordering::Relaxed);
         let me = qso::Station {
             callsign: cfg.callsign.clone(),
             name: cfg.name.clone(),
