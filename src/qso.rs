@@ -157,6 +157,7 @@ pub fn spawn(
         sdes: Vec::new(),
         next_keepalive: Instant::now(),
         tries: 0,
+        bye_retried: false,
         last_heard: Instant::now(),
         last_voice: None,
         link: Default::default(),
@@ -191,6 +192,8 @@ struct Engine {
     sdes: Vec<u8>,
     next_keepalive: Instant,
     tries: u32,
+    /// The station turned our first call away with an immediate BYE and we have already tried again.
+    bye_retried: bool,
     last_heard: Instant,
     last_voice: Option<Instant>,
     /// Voice packet health for the LINK gauge, and when the last one came.
@@ -311,6 +314,7 @@ impl Engine {
                 self.hang_up("switching stations");
                 self.set_state(State::Connecting { ip, label: label.clone() });
                 self.tries = 0;
+                self.bye_retried = false;
                 self.next_keepalive = Instant::now();
                 self.emit(Event::Log(format!("Calling {label} ({ip})…")));
             }
@@ -377,6 +381,16 @@ impl Engine {
             if from_peer { "" } else { " [not our peer]" }
         );
         if rtp::is_bye(p) {
+            // Many stations answer the very first call from a computer they haven't yet seen
+            // in the directory with an instant BYE, and accept the second call. Try once more
+            // automatically, so the user doesn't have to click Connect twice.
+            if from_peer && matches!(self.state, State::Connecting { .. }) && !self.bye_retried {
+                self.bye_retried = true;
+                self.tries = 0;
+                self.next_keepalive = Instant::now() + Duration::from_millis(1200);
+                self.emit(Event::Log("The station turned the first call away; trying once more…".into()));
+                return;
+            }
             if from_peer {
                 self.ptt(false);
                 self.end_rx();

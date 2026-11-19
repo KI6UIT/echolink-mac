@@ -40,7 +40,7 @@ impl Layout {
         let text = std::fs::read_to_string(split_path()).unwrap_or_default();
         let mut lines = text.lines();
         let mut nums = lines.next().unwrap_or("").split_whitespace().filter_map(|t| t.parse::<f32>().ok()).map(|v| v.clamp(0.05, 0.9));
-        let (top, audio) = (nums.next().unwrap_or(0.30), nums.next().unwrap_or(0.32));
+        let (top, audio) = (nums.next().unwrap_or(0.26), nums.next().unwrap_or(0.50));
         let mut gauges: Vec<usize> = lines.next().unwrap_or("").split_whitespace().filter_map(|t| t.parse().ok()).collect();
         let mut sorted = gauges.clone();
         sorted.sort();
@@ -62,7 +62,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("EchoLink")
             .with_app_id("echolink-gui")
-            .with_inner_size([1150.0, 720.0])
+            .with_inner_size([1320.0, 900.0])
             .with_min_inner_size([800.0, 520.0]),
         // Don't block on vsync: a window on a hidden workspace gets no frame
         // callbacks, which would otherwise stall the whole UI thread.
@@ -141,6 +141,7 @@ struct Gui {
     session: Option<Session>,
     start_error: Option<String>,
     settings: Option<settings::Form>,
+    appearance_open: bool,
     filter: Filter,
     search: String,
     favorites_only: bool,
@@ -204,6 +205,7 @@ impl Gui {
             selected: None,
             node_input: String::new(),
             chat_input: String::new(),
+            appearance_open: false,
             ptt_held_by_mouse: false,
             ptt_on: false,
             closing: false,
@@ -1044,6 +1046,7 @@ impl Gui {
                 lines: vec![("Not connected".to_string(), theme::muted()), (format!("Directory {}", s.dir_status.split(" · ").next().unwrap_or("")), theme::muted()), (route.to_string(), theme::muted())],
             }
         };
+        let link_card = card.clone();
         let mut by_id: Vec<Option<theme::Cell>> = vec![
             Some(theme::Cell::Gauge(theme::Gauge { label: "RX", value: rx, scale: theme::Scale::Level, active: true, marker: None })),
             Some(theme::Cell::Gauge(theme::Gauge { label: "MIC", value: mic, scale: theme::Scale::Level, active: true, marker: shared.vox.load(Ordering::Relaxed).then(|| shared.vox_x1000.load(Ordering::Relaxed) as f32 / 1000.0) })),
@@ -1053,7 +1056,56 @@ impl Gui {
             Some(theme::Cell::Card(card)),
         ];
         let cells: Vec<theme::Cell> = self.gauge_order.iter().filter_map(|&id| by_id.get_mut(id).and_then(Option::take)).collect();
-        let ev = theme::gauge_grid(ui, &cells);
+        let ev = if theme::pal().dial {
+            // Zeus layout: two big dials, then a row of LED bars with rings beside them.
+            let rx_active = true;
+            let mic_marker = shared.vox.load(Ordering::Relaxed).then(|| shared.vox_x1000.load(Ordering::Relaxed) as f32 / 1000.0);
+            theme::card_panel(ui, "Signal meters", |ui| {
+                let gap = 8.0;
+                // Keep each dial at its natural proportions (about 1.9 : 1) and centre the pair,
+                // instead of stretching them across a wide window.
+                let avail = ui.available_width();
+                let w = ((avail - gap) / 2.0).clamp(120.0, 470.0);
+                let h = (w / 1.9).clamp(100.0, 250.0);
+                ui.spacing_mut().item_spacing.x = gap;
+                ui.horizontal(|ui| {
+                    ui.add_space(((avail - 2.0 * w - gap) / 2.0).max(0.0));
+                    theme::vu_gauge(ui, &theme::Gauge { label: "RX level", value: rx, scale: theme::Scale::Level, active: rx_active, marker: None }, egui::Vec2::new(w, h));
+                    theme::vu_gauge(ui, &theme::Gauge { label: "MIC level", value: mic, scale: theme::Scale::Level, active: true, marker: mic_marker }, egui::Vec2::new(w, h));
+                });
+            });
+            theme::card_panel(ui, "Level bars", |ui| {
+                let gap = 8.0;
+                ui.spacing_mut().item_spacing.x = gap;
+                let ring_h = (ui.available_width() * 0.11).clamp(150.0, 210.0);
+                let ring = egui::Vec2::new((ring_h * 0.7).clamp(104.0, 150.0), ring_h);
+                let bars_w = (ui.available_width() - 2.0 * ring.x - 2.0 * gap).max(220.0);
+                ui.horizontal(|ui| {
+                    let bars = [
+                        theme::Bar { label: "RX", value: rx, scale: theme::Scale::Level, active: true },
+                        theme::Bar { label: "MIC", value: mic, scale: theme::Scale::Level, active: true },
+                        theme::Bar { label: "COMP", value: comp, scale: theme::Scale::Reduction, active: shared.auto_gain.load(Ordering::Relaxed) || shared.comp_mode.load(Ordering::Relaxed) > 0 },
+                        theme::Bar { label: "NR", value: nr, scale: theme::Scale::Noise, active: shared.denoise.load(Ordering::Relaxed) },
+                        theme::Bar { label: "LINK", value: quality, scale: theme::Scale::Quality, active: linked },
+                    ];
+                    theme::led_bars(ui, &bars, egui::Vec2::new(bars_w, ring.y));
+                    theme::ring_gauge(ui, "LINK QUALITY", quality, &format!("{:.0}%", quality * 100.0), grade_color(quality), linked, ring);
+                    let vol = (shared.volume() / echolink::audio::MAX_VOLUME).clamp(0.0, 1.0);
+                    theme::ring_gauge(ui, "VOLUME", vol, &format!("{:.0}%", shared.volume() * 100.0), theme::accent(), true, ring);
+                });
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(&link_card.title).strong().color(link_card.title_color));
+                    for (text, color) in &link_card.lines {
+                        ui.label(RichText::new(format!("·  {text}")).monospace().size(12.0).color(*color));
+                    }
+                });
+            });
+            theme::section_label(ui, "Audio controls");
+            theme::GridEvent::default()
+        } else {
+            theme::gauge_grid(ui, &cells)
+        };
         if let Some((from, to)) = ev.moved {
             let id = self.gauge_order.remove(from);
             self.gauge_order.insert(to, id);
@@ -1380,6 +1432,7 @@ impl eframe::App for Gui {
         }
 
         self.top_bar(ctx);
+        theme::appearance_window(ctx, &mut self.appearance_open);
         self.status_bar(ctx);
         self.poll_page();
         self.edit_dialog(ctx);
@@ -1416,7 +1469,11 @@ impl eframe::App for Gui {
             .max_width(list_max)
             .show(ctx, |ui| {
                 ui.set_opacity(theme::reveal(ctx, "list", 0.05));
-                self.station_list(ui);
+                if theme::pal().dial {
+                    theme::card_panel(ui, "Stations", |ui| self.station_list(ui));
+                } else {
+                    self.station_list(ui);
+                }
             });
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.set_opacity(theme::reveal(ctx, "qso", 0.30));
@@ -1434,6 +1491,49 @@ impl Gui {
             .inner_margin(egui::Margin::symmetric(14, 8));
         egui::TopBottomPanel::top("top").frame(frame).show(ctx, |ui| {
             ui.set_opacity(theme::reveal(ctx, "top", 0.0));
+            // Menu bar, in the manner of Thetis: File, Station, View, Setup.
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("File", |ui| {
+                    if ui.button("Exit").clicked() {
+                        ui.close_menu();
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+                ui.menu_button("Station", |ui| {
+                    if let Some(s) = &mut self.session {
+                        if ui.button("Refresh station list").clicked() {
+                            s.refresh();
+                            ui.close_menu();
+                        }
+                        let mut dnd = s.cfg.dnd;
+                        if ui.checkbox(&mut dnd, "Do Not Disturb").on_hover_text("Refuse every incoming call").changed() {
+                            s.set_dnd(dnd);
+                        }
+                    } else {
+                        ui.add_enabled(false, egui::Button::new("Not started"));
+                    }
+                });
+                ui.menu_button("View", |ui| {
+                    for (label, tab) in [("Station log", Tab::Station), ("Logbook", Tab::Logbook), ("Nets", Tab::Nets)] {
+                        if ui.radio(self.tab == tab, label).clicked() {
+                            self.tab = tab;
+                            ui.close_menu();
+                        }
+                    }
+                });
+                ui.menu_button("Setup", |ui| {
+                    if ui.button("Settings…").clicked() {
+                        let current = config::load().ok();
+                        self.settings = Some(settings::Form::new(current.as_ref()));
+                        ui.close_menu();
+                    }
+                    if ui.button("Appearance…").clicked() {
+                        self.appearance_open = true;
+                        ui.close_menu();
+                    }
+                });
+            });
+            ui.separator();
             ui.horizontal(|ui| {
                 ui.label(theme::head("ECHO", 24.0).color(theme::accent()));
                 ui.add_space(-8.0);
@@ -1455,33 +1555,14 @@ impl Gui {
                     ui.painter().circle_filled(rect.center(), 4.5, color);
                     ui.label(RichText::new(&s.dir_status).color(theme::muted()).small());
                 }
+                // The quick Do Not Disturb switch stays on screen; everything else is in the menus.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("SETTINGS").clicked() {
-                        let current = config::load().ok();
-                        self.settings = Some(settings::Form::new(current.as_ref()));
-                    }
-                    if let Some(s) = &mut self.session
-                        && ui.button("REFRESH LIST").clicked()
-                    {
-                        s.refresh();
-                    }
-                    if self.session.is_some() && ui.button("LOGBOOK").on_hover_text("Your contacts, QRZ sync and ADIF export").clicked() {
-                        self.tab = Tab::Logbook;
-                    }
                     if let Some(s) = &mut self.session {
                         let on = s.cfg.dnd;
                         let label = RichText::new("DND").color(if on { theme::tx() } else { theme::text() });
-                        if ui
-                            .button(label)
-                            .on_hover_text("Do Not Disturb: refuse every incoming call")
-                            .clicked()
-                        {
+                        if ui.button(label).on_hover_text("Do Not Disturb: refuse every incoming call").clicked() {
                             s.set_dnd(!on);
                         }
-                    }
-                    ui.add_space(6.0);
-                    if let Some(i) = theme::picker(ui) {
-                        theme::set(ctx, i);
                     }
                 });
             });
@@ -1697,7 +1778,11 @@ impl Gui {
 
     /// Connect row, node entry, and the talk-and-station tile.
     fn qso_top(&mut self, ui: &mut egui::Ui) {
-        self.deck(ui);
+        if theme::pal().dial {
+            theme::card_panel(ui, "Connection", |ui| self.deck(ui));
+        } else {
+            self.deck(ui);
+        }
     }
 
     /// The controls you reach for most, kept at the very top: connect / disconnect (naming the
@@ -1775,7 +1860,11 @@ impl Gui {
     /// Gauges, mic and speaker controls, and the DTMF keypad.
     fn qso_audio(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
-        egui::CollapsingHeader::new(RichText::new("AUDIO").size(13.5).strong().color(theme::text())).default_open(true).show(ui, |ui| self.audio_panel(ui));
+        if theme::pal().dial {
+            self.audio_panel(ui);
+        } else {
+            egui::CollapsingHeader::new(RichText::new("AUDIO").size(13.5).strong().color(theme::text())).default_open(true).show(ui, |ui| self.audio_panel(ui));
+        }
         self.keypad(ui);
     }
 
@@ -1792,6 +1881,7 @@ impl Gui {
             self.nets_tab(ui);
             return;
         }
+        theme::section_label(ui, "Station log");
         let log_height = (ui.available_height() - 40.0).max(60.0);
         egui::Frame::new().fill(theme::screen()).stroke(egui::Stroke::new(1.0, theme::edge())).corner_radius(3).inner_margin(8).show(ui, |ui| {
             egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).max_height(log_height).show(ui, |ui| {
@@ -1918,7 +2008,7 @@ impl Gui {
         let rp = p.with_clip_rect(right.shrink2(egui::vec2(8.0, 4.0)));
         let x = right.left() + 14.0;
         rp.text(egui::pos2(x, right.top() + 16.0), egui::Align2::LEFT_CENTER, label, egui::FontId::new(10.5, theme::display()), theme::muted());
-        rp.text(egui::pos2(x, right.center().y + 1.0), egui::Align2::LEFT_CENTER, call, egui::FontId::new(size, theme::display()), call_color);
+        rp.text(egui::pos2(x, right.center().y + 1.0), egui::Align2::LEFT_CENTER, call, egui::FontId::new(size, if theme::pal().dial { theme::mono_medium() } else { theme::display() }), call_color);
         rp.text(egui::pos2(x, right.bottom() - 15.0), egui::Align2::LEFT_CENTER, detail, egui::FontId::new(11.0, FontFamily::Monospace), theme::muted());
         self.ptt_held_by_mouse = down;
     }

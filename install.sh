@@ -53,11 +53,13 @@ if [[ "$(uname)" == "Darwin" ]]; then
   <key>CFBundleExecutable</key><string>echolink-gui</string>
   <key>CFBundleIconFile</key><string>EchoLink</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleShortVersionString</key><string>0.0.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSMicrophoneUsageDescription</key><string>EchoLink needs the microphone to transmit your voice.</string>
 </dict></plist>
 PLIST
+        VER=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+        sed -i '' "s|<string>0.0.0</string>|<string>$VER</string>|" "$app/Contents/Info.plist"
         # Ad-hoc sign so macOS will let the bundle ask for microphone access.
         codesign --force --deep --sign - "$app" >/dev/null 2>&1 || true
         echo "Installed $app (find it in Launchpad or ~/Applications) and echolink-tui in $bin."
