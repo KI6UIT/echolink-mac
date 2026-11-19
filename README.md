@@ -1,9 +1,9 @@
 # EchoLink for Mac
 
 A native-feeling **EchoLink** desktop app for macOS, written in Rust. It looks like a piece of
-bench gear instead of a web dashboard: swing-needle gauges, a status tile that shows who you're
-linked to, and a big push-to-talk key that glows when you're on the air. Pick one of four themes with
-one click.
+bench gear instead of a web dashboard: analog needle meters, LED level bars, a status tile that shows
+who you're linked to, and a big push-to-talk key that glows when you're on the air. Pick one of five
+themes, including the dark **Midnight Console** SDR look, from **Setup > Appearance**.
 
 ![Desktop app](docs/gui.png)
 
@@ -154,17 +154,24 @@ headset). If a chosen device isn't connected, the app falls back to the system d
 
 ## Themes
 
-Click a swatch in the top bar, just left of **Refresh list**. The change is instant and is
-remembered between launches.
+Open **Setup > Appearance** in the menu bar. The change is instant and is remembered between launches.
 
 | Theme | Look |
 |---|---|
-| **Amber** (default) | Warm black chassis with amber phosphor |
+| **Midnight Console** (default) | Near-black SDR-console look: card panels, analog needle meters on a brushed-metal face, LED level bars and ring gauges |
+| **Amber** | Warm black chassis with amber phosphor |
 | **Phosphor** | Green-screen terminal |
 | **Cobalt** | Night-watch navy with an ice-cyan display |
 | **Paper** | Daylight: logbook cream with fountain-pen ink |
 
-The choice is saved in `~/Library/Application Support/echolink-tui/gui-theme`.
+In Midnight Console you can also choose the **meter face**: brushed metal (near-black, light markings)
+or cream paper (black markings).
+
+The choices are saved in `~/Library/Application Support/echolink-tui/gui-theme` and `gui-meterface`.
+
+The menu bar has **File**, **Station** (refresh the list, Do Not Disturb), **View** (station log, logbook,
+nets) and **Setup** (Settings, Appearance). Settings and the logbook, which used to be buttons in the
+top bar, are in these menus now; the quick **DND** button stays on screen.
 
 ## Requirements
 
@@ -236,7 +243,7 @@ the top of the script explain how.
 - Click ☆ to make a station a favorite. **★ Favorites** shows only those.
 - Drag the **dividers** between the controls, the audio section and the logbook/nets area to give each the room
   you want; they remember their place. The line between the station list and this column moves too.
-- **Settings** changes your details or connection. The app restarts itself to apply them.
+- **Setup > Settings** changes your details or connection. The app restarts itself to apply them.
 - Closing the window disconnects and logs you off the directory.
 
 Try ECHOTEST (node 9999) first. It plays back what you say.
@@ -313,7 +320,7 @@ tap on, then off, elsewhere.
 ## Customizing the look
 
 The whole look lives in `src/bin/echolink-gui/theme.rs`. Colors come from a `Palette` struct,
-so a new theme is one more entry in `PALETTES`. The swatch picker, the saved choice and every
+so a new theme is one more entry in `PALETTES`. The Appearance window, the saved choice and every
 widget pick it up automatically. The fonts are [Chakra Petch](https://fonts.google.com/specimen/Chakra+Petch)
 for labels and [DM Mono](https://fonts.google.com/specimen/DM+Mono) for data, both embedded
 from `assets/fonts/` under the SIL Open Font License.
